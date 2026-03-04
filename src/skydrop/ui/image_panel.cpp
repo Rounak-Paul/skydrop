@@ -22,52 +22,71 @@ static bool IsNonStbFormat(const std::string& path) {
 
 namespace sky {
 
-bool ImagePanel::LoadImage(const std::string& path) {
-    if (!image_.Load(path)) return false;
-
-    // Create GPU texture for display.
-    auto* app = tvk::App::Get();
-    if (app) {
-        // For formats stb_image can handle, use tinyvk's file loader (fast path).
-        // For HEIC/WebP/AVIF, skip it to avoid the "[ERROR] Failed to load" log.
-        if (!IsNonStbFormat(path)) {
-            texture_ = app->LoadTexture(path);
-        }
-
-        // Create texture from our already-decoded pixels if needed.
-        if (!texture_ && !image_.Pixels().empty()) {
-            texture_ = tvk::Texture::Create(
-                app->GetRenderer(),
-                image_.Pixels().data(),
-                image_.Width(), image_.Height());
-        }
-
-        if (texture_) texture_->BindToImGui();
+void ImagePanel::LoadImage(const std::string& path) {
+    // If a previous load is still in-flight, let it finish before starting new.
+    if (loading_.load() && loadFuture_.valid()) {
+        loadFuture_.wait();
+        loading_.store(false);
     }
-
-    // Launch analysis on a background thread.
     analyzed_ = false;
-    analyzing_.store(true);
+    loading_.store(true);
 
-    // Copy image data for the background thread (ImageData is value-type safe).
-    ImageData imageCopy = image_;
-    analysisFuture_ = std::async(std::launch::async, [imageCopy = std::move(imageCopy)]() {
-        return ImageAnalyzer::Analyze(imageCopy);
+    // Keep old texture alive through the current frame (ImGui may still reference it).
+    prevTexture_ = std::move(texture_);
+
+    // Decode + analyse entirely on a background thread.
+    loadFuture_ = std::async(std::launch::async, [path]() -> LoadResult {
+        LoadResult r;
+        r.path = path;
+        if (r.image.Load(path)) {
+            r.analysis = ImageAnalyzer::Analyze(r.image);
+        }
+        return r;
     });
-
-    return true;
 }
 
-void ImagePanel::PollAnalysis() {
-    if (!analyzing_.load()) return;
-    if (!analysisFuture_.valid()) return;
+void ImagePanel::CreateTexture(const std::string& path) {
+    auto* app = tvk::App::Get();
+    if (!app) return;
 
-    // Check if the future is ready (non-blocking).
-    if (analysisFuture_.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
-        analysis_ = analysisFuture_.get();
-        analyzed_ = true;
-        analyzing_.store(false);
+    // For formats stb_image can handle, use tinyvk's file loader (fast path).
+    if (!IsNonStbFormat(path)) {
+        texture_ = app->LoadTexture(path);
     }
+
+    // Create from decoded pixels if the fast path didn't work.
+    if (!texture_ && !image_.Pixels().empty()) {
+        texture_ = tvk::Texture::Create(
+            app->GetRenderer(),
+            image_.Pixels().data(),
+            image_.Width(), image_.Height());
+    }
+
+    if (texture_) texture_->BindToImGui();
+}
+
+void ImagePanel::Poll() {
+    // Release the previous frame's texture now that it's no longer in-flight.
+    prevTexture_.reset();
+
+    if (!loading_.load()) return;
+    if (!loadFuture_.valid()) return;
+
+    // Non-blocking check.
+    if (loadFuture_.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
+        return;
+
+    auto result = loadFuture_.get();
+    loading_.store(false);
+
+    if (!result.image.IsLoaded()) return;
+
+    image_    = std::move(result.image);
+    analysis_ = std::move(result.analysis);
+    analyzed_ = true;
+
+    // GPU texture upload (must happen on the main thread).
+    CreateTexture(result.path);
 }
 
 void ImagePanel::Draw() {

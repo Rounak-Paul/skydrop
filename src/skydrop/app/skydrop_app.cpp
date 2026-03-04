@@ -25,18 +25,21 @@ void SkydropApp::OnUpdate() {
 
 void SkydropApp::OnStop() {
     engine_.Shutdown();
+    graph_.Clear();
+    graphBuilt_ = false;
+    synthId_ = reverbId_ = outputId_ = 0;
+    imagePanel_.ReleaseTexture();
 }
 
 // ── Main UI ──────────────────────────────────────────────────────────────────
 
 void SkydropApp::OnUI() {
-    // Poll async analysis.
-    imagePanel_.PollAnalysis();
+    // Poll async load + analysis.
+    imagePanel_.Poll();
 
     // When analysis just completed, apply data to synth and start playing.
     if (pendingApply_ && imagePanel_.IsAnalyzed()) {
         ApplyImage();
-        if (autoPlay_) engine_.Play();
         pendingApply_ = false;
     }
 
@@ -83,7 +86,7 @@ void SkydropApp::OpenImage() {
     engine_.Stop();
     imagePanel_.LoadImage(result.value());
 
-    // Build the graph now (fast), but defer ApplyImage until analysis finishes.
+    // Build the graph now (fast), defer ApplyImage until bg decode+analysis finish.
     BuildGraph();
     pendingApply_ = true;
 }
@@ -153,10 +156,10 @@ void SkydropApp::DrawImageSection() {
         OpenImage();
 
     // Quick analysis summary.
-    if (imagePanel_.IsAnalyzing()) {
+    if (imagePanel_.IsLoading()) {
         ImGui::Spacing();
         ImGui::TextColored(ImVec4(0.7f, 0.6f, 0.3f, 1.0f),
-            ICON_FA_SPINNER " Analyzing image...");
+            ICON_FA_SPINNER " Loading & analyzing...");
     } else if (imagePanel_.IsAnalyzed()) {
         auto& a = imagePanel_.GetAnalysis();
         ImGui::Spacing();
@@ -189,7 +192,6 @@ void SkydropApp::DrawControlsSection() {
             BuildGraph();
             if (imagePanel_.IsAnalyzed()) {
                 ApplyImage();
-                if (autoPlay_) engine_.Play();
             } else {
                 pendingApply_ = true;
             }
@@ -401,6 +403,10 @@ void SkydropApp::ApplyImage() {
     auto* node     = graph_.GetNode(synthId_);
     if (!node) return;
 
+    // Stop audio while we mutate the synth node's composition data.
+    bool wasPlaying = engine_.IsPlaying();
+    engine_.Stop();
+
     // All synth nodes now use the unified SetImageData interface.
     switch (currentAlgo_) {
     case Algorithm::Ethereal:
@@ -415,6 +421,8 @@ void SkydropApp::ApplyImage() {
         dynamic_cast<RegionPadNode*>(node)->SetImageData(image, analysis);      break;
     default: break;
     }
+
+    if (wasPlaying || autoPlay_) engine_.Play();
 }
 
 } // namespace sky
