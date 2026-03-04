@@ -1,0 +1,6 @@
+[submodule "src/vendors/tinyvk"]
+	path = src/vendors/tinyvk
+	url = https://github.com/Rounak-Paul/tinyvk.git
+[submodule "src/vendors/openal-soft"]
+	path = src/vendors/openal-soft
+	url = https://github.com/Rounak-Paul/openal-soft.git
