@@ -1,54 +1,25 @@
 /// @file image_composer.cpp
-/// @brief Complete image-to-music composition engine.
+/// @brief Image-to-music composition with musical structure, motifs, and dynamics.
+///
+/// The image drives every musical element:
+///   - Structure: image divided into vertical regions; color similarity → section repeats
+///   - Motifs: melodic phrases extracted from image regions; repeated with variation
+///   - Builds/drops: brightness gradients → crescendo/decrescendo
+///   - Chord progressions: repeated for similar sections
+///   - Drum density: section-aware (sparse intro, full chorus, fills at transitions)
+///   - Bass style: section-aware (sustained in verse, punchy in chorus)
+///   - Smoothness: portamento derived from image texture regularity
+///   - Dynamics: section energy envelopes, not flat brightness scanning
 
 #include "skydrop/synth/image_composer.h"
 #include <algorithm>
 #include <cmath>
+#include <numeric>
 
 namespace sky {
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Chord progression templates
-// ═══════════════════════════════════════════════════════════════════════════
-
-struct ChordTemplate {
-    i32 rootSemitone;               ///< Offset from key root in semitones.
-    std::vector<i32> intervals;     ///< Intervals making up the chord.
-};
-
-using Progression = std::vector<ChordTemplate>;
-
-/// Major-key progressions.
-static const Progression kMajorProgs[] = {
-    // I – V – vi – IV  (pop anthem)
-    {{0, {0,4,7}}, {7, {0,4,7}}, {9, {0,3,7}}, {5, {0,4,7}}},
-    // I – vi – IV – V  (classic)
-    {{0, {0,4,7}}, {9, {0,3,7}}, {5, {0,4,7}}, {7, {0,4,7}}},
-    // I – IV – V – IV  (bright)
-    {{0, {0,4,7}}, {5, {0,4,7}}, {7, {0,4,7}}, {5, {0,4,7}}},
-    // vi – IV – I – V  (modern pop)
-    {{9, {0,3,7}}, {5, {0,4,7}}, {0, {0,4,7}}, {7, {0,4,7}}},
-    // I – IV – vi – V  (lyrical)
-    {{0, {0,4,7}}, {5, {0,4,7}}, {9, {0,3,7}}, {7, {0,4,7}}},
-};
-
-/// Minor-key progressions.
-static const Progression kMinorProgs[] = {
-    // i – VI – III – VII  (emotional)
-    {{0, {0,3,7}}, {8, {0,4,7}}, {3, {0,4,7}}, {10, {0,4,7}}},
-    // i – iv – VII – III  (dark)
-    {{0, {0,3,7}}, {5, {0,3,7}}, {10, {0,4,7}}, {3, {0,4,7}}},
-    // i – VII – VI – VII  (cinematic)
-    {{0, {0,3,7}}, {10, {0,4,7}}, {8, {0,4,7}}, {10, {0,4,7}}},
-    // i – iv – v – i  (haunting)
-    {{0, {0,3,7}}, {5, {0,3,7}}, {7, {0,3,7}}, {0, {0,3,7}}},
-};
-
-constexpr u32 kNumMajorProgs = sizeof(kMajorProgs) / sizeof(kMajorProgs[0]);
-constexpr u32 kNumMinorProgs = sizeof(kMinorProgs) / sizeof(kMinorProgs[0]);
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Helper: snap MIDI note to nearest scale tone
+// Helpers
 // ═══════════════════════════════════════════════════════════════════════════
 
 static i32 SnapMidiToScale(i32 midi, i32 root, const std::vector<i32>& scale) {
@@ -64,8 +35,80 @@ static i32 SnapMidiToScale(i32 midi, i32 root, const std::vector<i32>& scale) {
     return best;
 }
 
+static u32 NextRNG(u32& rng) {
+    rng = rng * 1664525u + 1013904223u;
+    return rng;
+}
+
+static f32 RandF(u32& rng) {
+    return static_cast<f32>(NextRNG(rng) & 0xFFFF) / 65535.0f;
+}
+
+static std::array<f32, 3> ToHSB(f32 r, f32 g, f32 b) {
+    f32 mx = std::max({r, g, b});
+    f32 mn = std::min({r, g, b});
+    f32 d  = mx - mn;
+    f32 h = 0, s = 0, v = mx;
+    if (mx > 1e-6f) s = d / mx;
+    if (d > 1e-6f) {
+        if      (mx == r) h = 60.0f * std::fmod((g - b) / d, 6.0f);
+        else if (mx == g) h = 60.0f * ((b - r) / d + 2.0f);
+        else              h = 60.0f * ((r - g) / d + 4.0f);
+    }
+    if (h < 0) h += 360.0f;
+    return {h, s, v};
+}
+
+static f32 ColorDist(const std::array<f32,4>& a, const std::array<f32,4>& b) {
+    f32 dr = a[0]-b[0], dg = a[1]-b[1], db = a[2]-b[2];
+    return std::sqrt(dr*dr + dg*dg + db*db);
+}
+
+static void Smooth(std::vector<f32>& v, u32 window) {
+    if (v.size() < 2 || window < 2) return;
+    std::vector<f32> tmp(v.size());
+    i32 half = static_cast<i32>(window) / 2;
+    for (i32 i = 0; i < static_cast<i32>(v.size()); ++i) {
+        f32 sum = 0; u32 cnt = 0;
+        for (i32 j = i - half; j <= i + half; ++j) {
+            if (j >= 0 && j < static_cast<i32>(v.size())) { sum += v[j]; ++cnt; }
+        }
+        tmp[i] = sum / std::max(cnt, 1u);
+    }
+    v = std::move(tmp);
+}
+
+static f32 SampleProfile(const std::vector<f32>& prof, f32 t) {
+    if (prof.empty()) return 0;
+    t = std::clamp(t, 0.0f, 1.0f);
+    f32 idx = t * static_cast<f32>(prof.size() - 1);
+    u32 lo = static_cast<u32>(std::floor(idx));
+    u32 hi = std::min(lo + 1, static_cast<u32>(prof.size() - 1));
+    f32 frac = idx - static_cast<f32>(lo);
+    return prof[lo] * (1.0f - frac) + prof[hi] * frac;
+}
+
+static f32 QuantizeDuration(f32 dur) {
+    static const f32 grid[] = {0.25f, 0.5f, 0.75f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f};
+    f32 best = grid[0];
+    f32 bestDist = std::abs(dur - grid[0]);
+    for (f32 g : grid) {
+        f32 d = std::abs(dur - g);
+        if (d < bestDist) { bestDist = d; best = g; }
+    }
+    return best;
+}
+
+/// Find which section contains a given beat.
+static const Section* SectionAt(const std::vector<Section>& sections, f32 beat) {
+    for (auto& s : sections)
+        if (beat >= s.startBeat && beat < s.endBeat) return &s;
+    return sections.empty() ? nullptr : &sections.back();
+}
+
+
 // ═══════════════════════════════════════════════════════════════════════════
-// ImageComposer
+// ImageComposer::Compose
 // ═══════════════════════════════════════════════════════════════════════════
 
 Composition ImageComposer::Compose(const ImageData& image,
@@ -78,60 +121,90 @@ Composition ImageComposer::Compose(const ImageData& image,
     c.rootNote = DeriveRootNote(analysis);
     c.scale    = DeriveScale(analysis);
 
-    // Loop length varies by style.
+    // Longer loops for proper structure: 16-32 bars (64-128 beats).
+    f32 aspect = static_cast<f32>(image.Width()) / std::max(1u, image.Height());
+    f32 baseBars;
     switch (style) {
-    case CompStyle::Ethereal:  c.totalBeats = 32; break;
-    case CompStyle::Harmonic:  c.totalBeats = 32; break;
-    case CompStyle::Rhythmic:  c.totalBeats = 16; break;
-    case CompStyle::Melodic:   c.totalBeats = 32; break;
-    case CompStyle::Cinematic: c.totalBeats = 32; break;
-    default:                   c.totalBeats = 32; break;
+    case CompStyle::Ethereal:  baseBars = 20.0f + aspect * 4.0f; break;
+    case CompStyle::Cinematic: baseBars = 24.0f + aspect * 4.0f; break;
+    case CompStyle::Rhythmic:  baseBars = 16.0f + aspect * 2.0f; break;
+    case CompStyle::Melodic:   baseBars = 16.0f + aspect * 4.0f; break;
+    case CompStyle::Harmonic:  baseBars = 16.0f + aspect * 4.0f; break;
+    default:                   baseBars = 16.0f + aspect * 4.0f; break;
     }
+    // Quantize to multiple of 4 bars for clean structure.
+    u32 bars = (static_cast<u32>(std::clamp(baseBars, 16.0f, 32.0f)) / 4) * 4;
+    c.totalBeats = static_cast<f32>(bars * 4);
 
+    // Image-derived timbre.
+    c.harmonicProfile = BuildHarmonicProfile(analysis);
+    c.detuneAmount    = 0.001f + analysis.color.complexity * 0.006f;
+    c.noiseBlend      = analysis.texture.roughness * 0.15f;
+    c.filterSweep     = analysis.texture.regularity * 0.4f;
+    c.portamentoRate  = analysis.texture.regularity * 0.6f
+                      + (1.0f - analysis.texture.roughness) * 0.3f;
+    // Lead chordiness: saturated, complex images → more chord leads.
+    c.leadChordiness  = analysis.color.saturation * 0.5f
+                      + analysis.color.complexity * 0.3f
+                      + (1.0f - analysis.texture.roughness) * 0.2f;
+    c.leadChordiness  = std::clamp(c.leadChordiness, 0.0f, 1.0f);
+    // Melody release: smoother images get longer sustain.
+    c.melodyRelease   = 0.2f + (1.0f - analysis.texture.roughness) * 0.4f
+                      + analysis.texture.regularity * 0.2f;
+
+    // Brightness / warmth from image.
+    c.brightness = analysis.color.brightness;
+    c.warmth     = (analysis.color.warmth + 1.0f) * 0.5f;
+
+    // ── Build structural plan from image ────────────────────────────
+    c.sections = BuildStructure(image, analysis, c.totalBeats, style);
+
+    // ── Build dynamic map from sections (not flat brightness scan) ──
+    c.dynamicMap = BuildDynamicMap(image, c.sections, c.totalBeats);
+
+    // ── Build musical layers (section-aware) ────────────────────────
     c.chords = BuildChords(image, analysis, c.rootNote, *c.scale, c.totalBeats, style);
     c.melody = BuildMelody(image, analysis, c.chords, c.rootNote, *c.scale, c.totalBeats, style);
-    c.bass   = BuildBass(c.chords, c.totalBeats, style);
-    c.drums  = BuildDrums(analysis, c.totalBeats, style);
+    c.bass   = BuildBass(image, analysis, c.chords, c.rootNote, *c.scale, c.totalBeats, style);
+    c.drums  = BuildDrums(image, analysis, c.totalBeats, style);
 
-    // Timbral settings from image + style.
-    c.brightness = analysis.color.brightness;
-    c.warmth     = (analysis.color.warmth + 1.0f) * 0.5f; // map -1..1 → 0..1
+    // Gain settings.
+    f32 imgEnergy = analysis.edges.density * 0.4f + analysis.texture.roughness * 0.3f
+                  + analysis.color.brightness * 0.3f;
 
     switch (style) {
     case CompStyle::Ethereal:
         c.melodyGain = 0.18f; c.chordGain = 0.25f; c.bassGain = 0.18f; c.drumGain = 0.04f;
-        c.padAttack = 1.5f; c.melodyAttack = 0.3f;
-        break;
+        c.padAttack = 1.5f; c.melodyAttack = 0.3f; break;
     case CompStyle::Harmonic:
         c.melodyGain = 0.28f; c.chordGain = 0.22f; c.bassGain = 0.20f; c.drumGain = 0.10f;
-        c.padAttack = 0.4f; c.melodyAttack = 0.02f;
-        break;
+        c.padAttack = 0.4f; c.melodyAttack = 0.02f; break;
     case CompStyle::Rhythmic:
         c.melodyGain = 0.22f; c.chordGain = 0.15f; c.bassGain = 0.28f; c.drumGain = 0.20f;
-        c.padAttack = 0.05f; c.melodyAttack = 0.005f;
-        break;
+        c.padAttack = 0.05f; c.melodyAttack = 0.005f; break;
     case CompStyle::Melodic:
         c.melodyGain = 0.32f; c.chordGain = 0.20f; c.bassGain = 0.18f; c.drumGain = 0.08f;
-        c.padAttack = 0.6f; c.melodyAttack = 0.01f;
-        break;
+        c.padAttack = 0.6f; c.melodyAttack = 0.01f; break;
     case CompStyle::Cinematic:
         c.melodyGain = 0.15f; c.chordGain = 0.30f; c.bassGain = 0.22f; c.drumGain = 0.05f;
-        c.padAttack = 2.0f; c.melodyAttack = 0.5f;
-        break;
+        c.padAttack = 2.0f; c.melodyAttack = 0.5f; break;
     default: break;
     }
+
+    c.drumGain *= (0.5f + imgEnergy);
+    c.bassGain *= (0.7f + imgEnergy * 0.6f);
 
     return c;
 }
 
-// ── Derive tempo ────────────────────────────────────────────────────────────
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Derive tempo, key, scale
+// ═══════════════════════════════════════════════════════════════════════════
 
 f32 ImageComposer::DeriveTempo(const ImageAnalysis& a, CompStyle style) {
-    // Base energy from edges + texture.
     f32 energy = a.edges.density * 0.5f + a.texture.roughness * 0.3f
                + a.color.brightness * 0.2f;
-
-    // Style-dependent range.
     f32 lo, hi;
     switch (style) {
     case CompStyle::Ethereal:  lo = 55;  hi = 80;  break;
@@ -141,124 +214,496 @@ f32 ImageComposer::DeriveTempo(const ImageAnalysis& a, CompStyle style) {
     case CompStyle::Cinematic: lo = 50;  hi = 75;  break;
     default:                   lo = 80;  hi = 130; break;
     }
-
     return lo + energy * (hi - lo);
 }
 
-// ── Derive key ──────────────────────────────────────────────────────────────
-
 i32 ImageComposer::DeriveRootNote(const ImageAnalysis& a) {
-    // Map dominant hue (0-360) to 12 pitch classes, then place in octave 3-4.
-    // Hue circle → circle of fifths ordering for musical coherence.
-    // 0°=C, 30°=G, 60°=D, 90°=A, 120°=E, 150°=B,
-    // 180°=F#, 210°=Db, 240°=Ab, 270°=Eb, 300°=Bb, 330°=F
     static const i32 hueToPC[] = {0,7,2,9,4,11,6,1,8,3,10,5};
     i32 segment = static_cast<i32>(a.color.dominantHue / 30.0f) % 12;
-    i32 pc = hueToPC[segment];
-
-    // Place in octave 3 (MIDI 48-59) for a comfortable root.
-    return 48 + pc;
+    return 48 + hueToPC[segment];
 }
-
-// ── Derive scale ────────────────────────────────────────────────────────────
 
 const std::vector<i32>* ImageComposer::DeriveScale(const ImageAnalysis& a) {
-    // Warm images → major family, cool → minor family.
-    // High complexity → modal, low complexity → pentatonic.
     bool warm = a.color.warmth > 0.0f;
-
-    if (a.color.complexity < 0.3f) {
+    if (a.color.complexity < 0.3f)
         return warm ? &scales::Pentatonic : &scales::MinorPenta;
-    } else if (a.color.complexity > 0.65f) {
+    else if (a.color.complexity > 0.65f)
         return warm ? &scales::Mixolydian : &scales::Dorian;
-    } else {
+    else
         return warm ? &scales::Major : &scales::Minor;
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BuildStructure — image regions → song sections
+// ═══════════════════════════════════════════════════════════════════════════
+
+std::vector<Section> ImageComposer::BuildStructure(
+    const ImageData& img, const ImageAnalysis& a, f32 totalBeats, CompStyle style)
+{
+    // Divide image into 8 vertical regions.
+    constexpr u32 kNumRegions = 8;
+    u32 totalBars = static_cast<u32>(totalBeats / 4.0f);
+    u32 barsPerRegion = std::max(1u, totalBars / kNumRegions);
+
+    // ── 1. Sample average color + brightness per region ─────────────
+    struct RegionInfo {
+        std::array<f32, 3> hsb;  // average HSB
+        f32 brightness;
+        f32 edgeDensity;
+    };
+    std::vector<RegionInfo> regions(kNumRegions);
+
+    for (u32 i = 0; i < kNumRegions; ++i) {
+        u32 x = i * img.Width() / kNumRegions;
+        u32 w = std::max(1u, img.Width() / kNumRegions);
+        if (x + w > img.Width()) w = img.Width() - x;
+
+        auto col = img.AverageColor(x, 0, w, img.Height());
+        regions[i].hsb = ToHSB(col[0], col[1], col[2]);
+        regions[i].brightness = img.AverageBrightness(x, 0, w, img.Height());
+        f32 t = static_cast<f32>(i) / kNumRegions;
+        regions[i].edgeDensity = SampleProfile(a.edges.verticalProfile, t);
     }
+
+    // ── 2. Compute color similarity between regions ─────────────────
+    // similarity[i][j] = 1.0 if identical, 0 if maximally different
+    auto colorSim = [&](u32 i, u32 j) -> f32 {
+        f32 dh = std::abs(regions[i].hsb[0] - regions[j].hsb[0]);
+        if (dh > 180) dh = 360 - dh;
+        dh /= 180.0f;
+        f32 ds = std::abs(regions[i].hsb[1] - regions[j].hsb[1]);
+        f32 db = std::abs(regions[i].brightness - regions[j].brightness);
+        return 1.0f - std::clamp((dh * 0.5f + ds * 0.3f + db * 0.2f), 0.0f, 1.0f);
+    };
+
+    // ── 3. Find brightness gradient (for builds/drops) ──────────────
+    std::vector<f32> briGrad(kNumRegions, 0.0f);
+    for (u32 i = 1; i < kNumRegions; ++i)
+        briGrad[i] = regions[i].brightness - regions[i-1].brightness;
+
+    // ── 4. Find the brightest region → Chorus candidate ─────────────
+    u32 chorusRegion = 0;
+    f32 maxBri = 0;
+    for (u32 i = 1; i < kNumRegions - 1; ++i) {
+        if (regions[i].brightness > maxBri) {
+            maxBri = regions[i].brightness;
+            chorusRegion = i;
+        }
+    }
+
+    // ── 5. Assign section types ─────────────────────────────────────
+    std::vector<SectionType> typeMap(kNumRegions);
+    std::vector<u32> regionGroup(kNumRegions);
+
+    // First pass: assign primary types.
+    typeMap[0] = SectionType::Intro;
+    typeMap[kNumRegions - 1] = SectionType::Outro;
+    typeMap[chorusRegion] = SectionType::Chorus;
+
+    for (u32 i = 1; i < kNumRegions - 1; ++i) {
+        if (i == chorusRegion) continue;
+
+        // Region similar to chorus → also Chorus.
+        if (colorSim(i, chorusRegion) > 0.75f) {
+            typeMap[i] = SectionType::Chorus;
+        }
+        // Big brightness jump → region before it is a Build/PreChorus.
+        else if (i + 1 < kNumRegions && briGrad[i + 1] > 0.15f) {
+            typeMap[i] = SectionType::PreChorus;
+        }
+        // Biggest brightness drop from previous → Drop.
+        else if (briGrad[i] < -0.20f) {
+            typeMap[i] = SectionType::Drop;
+        }
+        // Low brightness + low edge → Breakdown.
+        else if (regions[i].brightness < 0.3f && regions[i].edgeDensity < 0.2f) {
+            typeMap[i] = SectionType::Breakdown;
+        }
+        // Similar to region 0 or 1 → Verse.
+        else if (colorSim(i, 0) > 0.6f || colorSim(i, 1) > 0.6f) {
+            typeMap[i] = SectionType::Verse;
+        }
+        // Otherwise → Bridge.
+        else {
+            typeMap[i] = SectionType::Bridge;
+        }
+    }
+
+    // Assign region groups (similar regions get same group for motif reuse).
+    for (u32 i = 0; i < kNumRegions; ++i) regionGroup[i] = i;
+    for (u32 i = 0; i < kNumRegions; ++i) {
+        for (u32 j = 0; j < i; ++j) {
+            if (typeMap[i] == typeMap[j] && colorSim(i, j) > 0.55f) {
+                regionGroup[i] = regionGroup[j];
+                break;
+            }
+        }
+    }
+
+    // ── 6. Build section objects ────────────────────────────────────
+    std::vector<Section> sections;
+    for (u32 i = 0; i < kNumRegions; ++i) {
+        Section s;
+        s.type          = typeMap[i];
+        s.startBeat     = static_cast<f32>(i * barsPerRegion * 4);
+        s.endBeat       = static_cast<f32>(std::min((i + 1) * barsPerRegion, totalBars) * 4);
+        s.avgBrightness = regions[i].brightness;
+        s.regionIdx     = regionGroup[i];
+
+        // Energy: chorus/drop = high, intro/outro/breakdown = low.
+        switch (s.type) {
+        case SectionType::Chorus:    s.energy = 0.85f + regions[i].brightness * 0.15f; break;
+        case SectionType::Drop:      s.energy = 0.9f; break;
+        case SectionType::PreChorus: s.energy = 0.6f + regions[i].brightness * 0.2f; break;
+        case SectionType::Verse:     s.energy = 0.45f + regions[i].brightness * 0.2f; break;
+        case SectionType::Bridge:    s.energy = 0.35f + regions[i].brightness * 0.15f; break;
+        case SectionType::Breakdown: s.energy = 0.15f; break;
+        case SectionType::Intro:     s.energy = 0.2f + regions[i].brightness * 0.15f; break;
+        case SectionType::Outro:     s.energy = 0.3f; break;
+        }
+
+        // Detect build (brightness rising toward next section).
+        s.isBuild = (s.type == SectionType::PreChorus) ||
+                    (i + 1 < kNumRegions && briGrad[i + 1] > 0.1f);
+
+        // Detect drop (big brightness drop, like a beat drop).
+        s.isDrop  = (s.type == SectionType::Drop) ||
+                    (briGrad[i] < -0.2f && i > 0);
+
+        // Style adjustments.
+        if (style == CompStyle::Ethereal || style == CompStyle::Cinematic)
+            s.energy *= 0.8f;
+        if (style == CompStyle::Rhythmic)
+            s.energy = std::max(s.energy, 0.3f);
+
+        sections.push_back(s);
+    }
+
+    // Ensure last section ends exactly at totalBeats.
+    if (!sections.empty())
+        sections.back().endBeat = totalBeats;
+
+    return sections;
 }
 
-// ── Select progression index ────────────────────────────────────────────────
 
-u32 ImageComposer::SelectProgression(const ImageAnalysis& a, bool isMajor) {
-    // Use hue + saturation as a pseudo-hash to deterministically pick a progression.
-    f32 selector = std::fmod(a.color.dominantHue * 7.3f + a.color.saturation * 13.7f, 1.0f);
-    u32 maxIdx = isMajor ? kNumMajorProgs : kNumMinorProgs;
-    return static_cast<u32>(selector * maxIdx) % maxIdx;
+// ═══════════════════════════════════════════════════════════════════════════
+// ExtractMotif — short melodic phrase from an image region
+// ═══════════════════════════════════════════════════════════════════════════
+
+Motif ImageComposer::ExtractMotif(
+    const ImageData& img, u32 x, u32 w,
+    i32 root, const std::vector<i32>& scale, CompStyle style, u32& rng)
+{
+    Motif m;
+    u32 numNotes;
+    switch (style) {
+    case CompStyle::Ethereal:  numNotes = 3 + (NextRNG(rng) % 3); break;  // 3-5
+    case CompStyle::Cinematic: numNotes = 3 + (NextRNG(rng) % 3); break;
+    case CompStyle::Melodic:   numNotes = 5 + (NextRNG(rng) % 4); break;  // 5-8
+    case CompStyle::Harmonic:  numNotes = 4 + (NextRNG(rng) % 4); break;  // 4-7
+    case CompStyle::Rhythmic:  numNotes = 6 + (NextRNG(rng) % 4); break;  // 6-9
+    default:                   numNotes = 4 + (NextRNG(rng) % 4); break;
+    }
+
+    // Sample brightness centroids across the region.
+    u32 vertSamples = 12;
+    i32 prevInterval = 0;
+
+    for (u32 n = 0; n < numNotes; ++n) {
+        u32 sx = x + n * w / numNotes;
+        u32 sw = std::max(1u, w / numNotes);
+        if (sx + sw > img.Width()) sw = img.Width() - sx;
+
+        // Brightness centroid → pitch.
+        f32 weightedSum = 0, totalWeight = 0;
+        for (u32 r = 0; r < vertSamples; ++r) {
+            u32 y = r * img.Height() / vertSamples;
+            u32 h = std::max(1u, img.Height() / vertSamples);
+            f32 bri = img.AverageBrightness(sx, y, sw, h);
+            f32 yNorm = 1.0f - static_cast<f32>(r) / static_cast<f32>(vertSamples);
+            weightedSum += yNorm * bri;
+            totalWeight += bri;
+        }
+        f32 centroid = (totalWeight > 1e-6f) ? (weightedSum / totalWeight) : 0.5f;
+
+        // Convert to interval: centroid 0-1 → -12..+12 semitones.
+        i32 rawInterval = static_cast<i32>((centroid - 0.5f) * 24.0f);
+        // Stepwise motion preference: limit jump from previous note.
+        if (rawInterval > prevInterval + 5) rawInterval = prevInterval + 5;
+        if (rawInterval < prevInterval - 5) rawInterval = prevInterval - 5;
+        // Snap to scale.
+        i32 snapped = SnapMidiToScale(root + rawInterval, root, scale) - root;
+        m.intervals.push_back(snapped);
+        prevInterval = snapped;
+
+        // Duration from color gradient.
+        f32 dur = 1.0f; // default
+        if (n > 0) {
+            u32 prevX = x + (n - 1) * w / numNotes;
+            auto c1 = img.AverageColor(prevX, 0, sw, img.Height());
+            auto c2 = img.AverageColor(sx, 0, sw, img.Height());
+            f32 grad = ColorDist(c1, c2);
+            f32 gradNorm = std::clamp(grad * 5.0f, 0.0f, 1.0f);
+            switch (style) {
+            case CompStyle::Ethereal:  dur = 2.0f + (1.0f - gradNorm) * 2.0f; break;
+            case CompStyle::Cinematic: dur = 2.0f + (1.0f - gradNorm) * 2.0f; break;
+            case CompStyle::Rhythmic:  dur = 0.25f + (1.0f - gradNorm) * 0.75f; break;
+            case CompStyle::Melodic:   dur = 0.5f + (1.0f - gradNorm) * 1.5f; break;
+            default:                   dur = 0.5f + (1.0f - gradNorm) * 1.5f; break;
+            }
+        }
+        m.durations.push_back(QuantizeDuration(dur));
+
+        // Velocity from brightness.
+        f32 bri = img.AverageBrightness(sx, 0, sw, img.Height());
+        m.velocities.push_back(0.4f + bri * 0.5f);
+    }
+
+    return m;
 }
 
-// ── Build chord progression ─────────────────────────────────────────────────
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BuildHarmonicProfile
+// ═══════════════════════════════════════════════════════════════════════════
+
+std::vector<f32> ImageComposer::BuildHarmonicProfile(const ImageAnalysis& a) {
+    constexpr u32 kNumHarmonics = 8;
+    std::vector<f32> profile(kNumHarmonics, 0.0f);
+
+    if (a.frequencyBands.empty()) {
+        for (u32 h = 0; h < kNumHarmonics; ++h)
+            profile[h] = 1.0f / static_cast<f32>(h + 1);
+        return profile;
+    }
+
+    u32 numBands = static_cast<u32>(a.frequencyBands.size());
+    u32 groupSize = std::max(1u, numBands / kNumHarmonics);
+
+    for (u32 h = 0; h < kNumHarmonics; ++h) {
+        u32 startBand = h * groupSize;
+        u32 endBand = std::min(startBand + groupSize, numBands);
+        f32 sum = 0;
+        for (u32 b = startBand; b < endBand; ++b)
+            sum += a.frequencyBands[b].magnitude;
+        profile[h] = sum / static_cast<f32>(endBand - startBand);
+    }
+
+    f32 maxVal = *std::max_element(profile.begin(), profile.end());
+    if (maxVal > 1e-6f) {
+        for (auto& v : profile) v /= maxVal;
+    }
+    profile[0] = std::max(profile[0], 0.3f);
+
+    return profile;
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BuildDynamicMap — section-aware dynamics with builds, drops, crescendos
+// ═══════════════════════════════════════════════════════════════════════════
+
+std::vector<f32> ImageComposer::BuildDynamicMap(
+    const ImageData& img, const std::vector<Section>& sections, f32 totalBeats)
+{
+    u32 numBeats = static_cast<u32>(std::ceil(totalBeats));
+    std::vector<f32> dmap(numBeats, 0.5f);
+
+    for (u32 b = 0; b < numBeats; ++b) {
+        f32 beat = static_cast<f32>(b);
+        const Section* sec = SectionAt(sections, beat);
+        if (!sec) continue;
+
+        f32 secLen = sec->endBeat - sec->startBeat;
+        f32 secPos = (beat - sec->startBeat) / std::max(1.0f, secLen);  // 0 to 1
+
+        // Base intensity from section energy.
+        f32 intensity = sec->energy;
+
+        // Build: gradual crescendo through section.
+        if (sec->isBuild) {
+            intensity = sec->energy * (0.4f + 0.6f * secPos);
+        }
+
+        // Drop: silence at start, then slam in.
+        if (sec->isDrop) {
+            if (secPos < 0.1f)
+                intensity = 0.05f;                 // near-silence
+            else if (secPos < 0.15f)
+                intensity = sec->energy * 1.2f;    // impact
+            else
+                intensity = sec->energy;
+        }
+
+        // Intro: fade in.
+        if (sec->type == SectionType::Intro) {
+            intensity *= (0.2f + 0.8f * secPos);
+        }
+
+        // Outro: fade out.
+        if (sec->type == SectionType::Outro) {
+            intensity *= (1.0f - secPos * 0.7f);
+        }
+
+        // Breakdown: low and steady.
+        if (sec->type == SectionType::Breakdown) {
+            intensity = 0.15f + 0.1f * secPos;
+        }
+
+        dmap[b] = std::clamp(intensity, 0.05f, 1.0f);
+    }
+
+    Smooth(dmap, 2);
+    return dmap;
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BuildChords — section-aware with repetition for same section types
+// ═══════════════════════════════════════════════════════════════════════════
 
 std::vector<ChordEvent> ImageComposer::BuildChords(
     const ImageData& img, const ImageAnalysis& a,
     i32 root, const std::vector<i32>& scale, f32 totalBeats, CompStyle style)
 {
     std::vector<ChordEvent> chords;
-    bool isMajor = (a.color.warmth > 0.0f);
-    u32 progIdx = SelectProgression(a, isMajor);
+    if (!img.IsLoaded()) return chords;
 
-    const Progression& prog = isMajor ? kMajorProgs[progIdx] : kMinorProgs[progIdx];
+    // We need sections — use the composition's sections (passed via the Compose flow).
+    // BuildChords is called after BuildStructure, and can access image directly.
+    // We'll re-detect sections locally since they're not passed directly.
+    auto sections = BuildStructure(img, a, totalBeats, style);
 
-    // Beats per chord.
-    f32 beatsPerChord = totalBeats / static_cast<f32>(prog.size());
-
-    // For Rhythmic style: repeat the 4-chord progression to fill 16 beats.
-    // For others: spread across totalBeats.
-    u32 numChords = static_cast<u32>(prog.size());
-    if (style == CompStyle::Rhythmic && totalBeats >= 16) {
-        numChords = static_cast<u32>(prog.size()) * 2;
-        beatsPerChord = totalBeats / static_cast<f32>(numChords);
-    }
-
-    // Voicing octave adjustments by style.
-    i32 voicingOctave = 0; // above root
+    // Beats per chord by style.
+    f32 beatsPerChord;
     switch (style) {
-    case CompStyle::Ethereal:  voicingOctave = 0; break;
-    case CompStyle::Harmonic:  voicingOctave = 0; break;
-    case CompStyle::Rhythmic:  voicingOctave = 0; break;
-    case CompStyle::Melodic:   voicingOctave = -1; break;
-    case CompStyle::Cinematic: voicingOctave = -1; break;
-    default: break;
+    case CompStyle::Ethereal:  beatsPerChord = 4.0f; break;
+    case CompStyle::Cinematic: beatsPerChord = 4.0f; break;
+    case CompStyle::Harmonic:  beatsPerChord = 2.0f; break;
+    case CompStyle::Rhythmic:  beatsPerChord = 2.0f; break;
+    case CompStyle::Melodic:   beatsPerChord = 2.0f; break;
+    default:                   beatsPerChord = 4.0f; break;
     }
 
-    for (u32 i = 0; i < numChords; ++i) {
-        auto& templ = prog[i % prog.size()];
+    static const i32 hueToPCOffset[] = {0,7,2,9,4,11,6,1,8,3,10,5};
 
-        ChordEvent ev;
-        ev.startBeat = static_cast<f32>(i) * beatsPerChord;
-        ev.duration  = beatsPerChord;
+    // Cache chord progressions per region index for repetition.
+    std::unordered_map<u32, std::vector<ChordEvent>> regionChords;
 
-        // Image brightness at this time position modulates velocity.
-        f32 t = static_cast<f32>(i) / static_cast<f32>(numChords);
-        u32 imgX = static_cast<u32>(t * img.Width());
-        if (imgX >= img.Width()) imgX = img.Width() - 1;
-        f32 bri = img.AverageBrightness(imgX, 0, std::max(1u, img.Width() / numChords), img.Height());
-        ev.velocity = 0.4f + bri * 0.5f;
+    for (auto& sec : sections) {
+        f32 secLen = sec.endBeat - sec.startBeat;
+        u32 numChordsInSec = static_cast<u32>(secLen / beatsPerChord);
+        if (numChordsInSec == 0) numChordsInSec = 1;
 
-        // Build chord notes from template.
-        i32 chordRoot = root + templ.rootSemitone + voicingOctave * 12;
-        for (i32 iv : templ.intervals) {
-            i32 note = chordRoot + iv;
-            ev.midiNotes.push_back(note);
+        // Check if we already generated chords for this region.
+        auto it = regionChords.find(sec.regionIdx);
+        if (it != regionChords.end() && !it->second.empty()) {
+            // Reuse: copy chords with offset to this section's start beat.
+            auto& cached = it->second;
+            u32 chordsToUse = std::min(static_cast<u32>(cached.size()), numChordsInSec);
+            for (u32 i = 0; i < numChordsInSec; ++i) {
+                ChordEvent ev = cached[i % chordsToUse];
+                ev.startBeat = sec.startBeat + static_cast<f32>(i) * beatsPerChord;
+                ev.duration = beatsPerChord;
+                chords.push_back(ev);
+            }
+            continue;
         }
 
-        // For richer voicings, add octave doubling of root.
-        if (style == CompStyle::Cinematic || style == CompStyle::Ethereal) {
-            ev.midiNotes.push_back(chordRoot + 12);
+        // Generate new chords for this section from image.
+        std::vector<ChordEvent> secChords;
+
+        f32 regionT = sec.startBeat / totalBeats;
+        u32 imgX = static_cast<u32>(regionT * img.Width());
+        u32 imgW = std::max(1u, static_cast<u32>(secLen / totalBeats * img.Width()));
+        if (imgX + imgW > img.Width()) imgW = img.Width() - imgX;
+
+        for (u32 i = 0; i < numChordsInSec; ++i) {
+            u32 chordX = imgX + i * imgW / numChordsInSec;
+            u32 chordW = std::max(1u, imgW / numChordsInSec);
+            if (chordX + chordW > img.Width()) chordW = img.Width() - chordX;
+
+            auto avgColor = img.AverageColor(chordX, 0, chordW, img.Height());
+            auto hsb = ToHSB(avgColor[0], avgColor[1], avgColor[2]);
+            f32 hue = hsb[0], sat = hsb[1], bri = hsb[2];
+
+            // Chord root from hue.
+            i32 hueSegment = static_cast<i32>(hue / 30.0f) % 12;
+            i32 pcOffset = hueToPCOffset[hueSegment];
+            i32 chordRoot = SnapMidiToScale(root + pcOffset, root, scale);
+            while (chordRoot < root - 5) chordRoot += 12;
+            while (chordRoot > root + 16) chordRoot -= 12;
+
+            // Quality from saturation.
+            std::vector<i32> intervals;
+            if (sat > 0.55f)
+                intervals = {0, 4, 7};
+            else if (sat > 0.25f)
+                intervals = {0, 3, 7};
+            else
+                intervals = (hueSegment % 2 == 0)
+                    ? std::vector<i32>{0, 5, 7} : std::vector<i32>{0, 2, 7};
+
+            // Extensions from color variance.
+            f32 variance = 0;
+            u32 numSamples = std::min(8u, chordW);
+            if (numSamples > 1) {
+                auto prevSamp = img.AverageColor(chordX, 0, 1, img.Height());
+                for (u32 s = 1; s < numSamples; ++s) {
+                    u32 sx = chordX + s * chordW / numSamples;
+                    if (sx >= img.Width()) sx = img.Width() - 1;
+                    auto samp = img.AverageColor(sx, 0, 1, img.Height());
+                    variance += ColorDist(prevSamp, samp);
+                    prevSamp = samp;
+                }
+                variance /= static_cast<f32>(numSamples - 1);
+            }
+
+            if (variance > 0.08f) {
+                bool isMinor = (intervals.size() >= 2 && intervals[1] == 3);
+                intervals.push_back(isMinor ? 10 : 11);
+            }
+            if (variance > 0.15f)
+                intervals.push_back(14);
+
+            // Register from brightness + section type.
+            i32 voiceShift = static_cast<i32>((bri - 0.5f) * 2.0f) * 12;
+            if (sec.type == SectionType::Breakdown || sec.type == SectionType::Intro)
+                voiceShift -= 12;
+            if (sec.type == SectionType::Chorus)
+                voiceShift += 0; // higher register for chorus
+            if (style == CompStyle::Cinematic || style == CompStyle::Ethereal)
+                voiceShift -= 12;
+
+            ChordEvent ev;
+            ev.startBeat = sec.startBeat + static_cast<f32>(i) * beatsPerChord;
+            ev.duration  = beatsPerChord;
+            ev.velocity  = 0.30f + bri * 0.4f + sec.energy * 0.2f;
+
+            for (i32 iv : intervals)
+                ev.midiNotes.push_back(chordRoot + voiceShift + iv);
+
+            // Octave doubling in Chorus and Cinematic/Ethereal.
+            if (sec.type == SectionType::Chorus ||
+                style == CompStyle::Ethereal || style == CompStyle::Cinematic)
+                ev.midiNotes.push_back(chordRoot + voiceShift + 12);
+
+            secChords.push_back(ev);
+            chords.push_back(ev);
         }
 
-        // Add 7th for harmonic/melodic styles when complexity is high.
-        if ((style == CompStyle::Harmonic || style == CompStyle::Melodic) && a.color.complexity > 0.5f) {
-            // Minor 7th (10 semitones) for minor chords, major 7th (11) for major.
-            bool isMinor = (templ.intervals.size() >= 2 && templ.intervals[1] == 3);
-            ev.midiNotes.push_back(chordRoot + (isMinor ? 10 : 11));
-        }
-
-        chords.push_back(std::move(ev));
+        regionChords[sec.regionIdx] = std::move(secChords);
     }
 
     return chords;
 }
 
-// ── Build melody ────────────────────────────────────────────────────────────
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BuildMelody — motif-based with repetition, variation, call-and-response
+// ═══════════════════════════════════════════════════════════════════════════
 
 std::vector<NoteEvent> ImageComposer::BuildMelody(
     const ImageData& img, const ImageAnalysis& a,
@@ -268,292 +713,513 @@ std::vector<NoteEvent> ImageComposer::BuildMelody(
     std::vector<NoteEvent> melody;
     if (!img.IsLoaded() || chords.empty()) return melody;
 
-    // Style-dependent note density (beats per note).
-    f32 noteLen;
-    f32 restProb;   // probability of rest.
+    auto sections = BuildStructure(img, a, totalBeats, style);
+    u32 rng = static_cast<u32>(a.color.dominantHue * 100 + a.color.saturation * 1000
+                               + a.edges.density * 500);
+
+    // ── Extract motifs per unique region ─────────────────────────────
+    std::unordered_map<u32, Motif> regionMotifs;
+    for (auto& sec : sections) {
+        if (regionMotifs.count(sec.regionIdx)) continue;
+
+        f32 regionT = sec.startBeat / totalBeats;
+        u32 imgX = static_cast<u32>(regionT * img.Width());
+        u32 imgW = std::max(1u, static_cast<u32>((sec.endBeat - sec.startBeat)
+                   / totalBeats * img.Width()));
+        if (imgX + imgW > img.Width()) imgW = img.Width() - imgX;
+
+        regionMotifs[sec.regionIdx] = ExtractMotif(img, imgX, imgW, root, scale, style, rng);
+    }
+
+    // Style parameters.
     i32 melodyOctave;
+    f32 restProbBase;
     switch (style) {
-    case CompStyle::Ethereal:
-        noteLen = 4.0f; restProb = 0.3f; melodyOctave = 12; break;
-    case CompStyle::Harmonic:
-        noteLen = 1.0f; restProb = 0.15f; melodyOctave = 12; break;
-    case CompStyle::Rhythmic:
-        noteLen = 0.5f; restProb = 0.25f; melodyOctave = 12; break;
-    case CompStyle::Melodic:
-        noteLen = 0.75f; restProb = 0.1f; melodyOctave = 12; break;
-    case CompStyle::Cinematic:
-        noteLen = 4.0f; restProb = 0.5f; melodyOctave = 24; break;
-    default:
-        noteLen = 1.0f; restProb = 0.15f; melodyOctave = 12; break;
+    case CompStyle::Ethereal:  melodyOctave = 12; restProbBase = 0.30f; break;
+    case CompStyle::Harmonic:  melodyOctave = 12; restProbBase = 0.15f; break;
+    case CompStyle::Rhythmic:  melodyOctave = 12; restProbBase = 0.18f; break;
+    case CompStyle::Melodic:   melodyOctave = 12; restProbBase = 0.08f; break;
+    case CompStyle::Cinematic: melodyOctave = 24; restProbBase = 0.35f; break;
+    default:                   melodyOctave = 12; restProbBase = 0.15f; break;
     }
 
-    // Trace brightness across top 1/3 of image as pitch contour.
-    u32 numNotes = static_cast<u32>(totalBeats / noteLen);
-    if (numNotes == 0) numNotes = 1;
+    // ── Generate melody per section ─────────────────────────────────
+    i32 prevMidi = root + melodyOctave;
+    u32 repeatCount = 0;   // how many times this region's motif has been used
 
-    std::vector<f32> pitchContour(numNotes);
-    u32 stripH = std::max(1u, img.Height() / 3);
-    for (u32 i = 0; i < numNotes; ++i) {
-        f32 t = static_cast<f32>(i) / static_cast<f32>(numNotes);
-        u32 x = static_cast<u32>(t * img.Width());
-        u32 w = std::max(1u, img.Width() / numNotes);
-        if (x >= img.Width()) x = img.Width() - 1;
-        pitchContour[i] = img.AverageBrightness(x, 0, w, stripH);
-    }
+    for (size_t secIdx = 0; secIdx < sections.size(); ++secIdx) {
+        auto& sec = sections[secIdx];
+        f32 secLen = sec.endBeat - sec.startBeat;
+        f32 beat = sec.startBeat;
 
-    // Also use edge vertical profile for pitch guidance if available.
-    if (!a.edges.verticalProfile.empty()) {
-        for (u32 i = 0; i < numNotes; ++i) {
-            u32 profIdx = i * static_cast<u32>(a.edges.verticalProfile.size()) / numNotes;
-            if (profIdx < a.edges.verticalProfile.size()) {
-                pitchContour[i] = pitchContour[i] * 0.6f + a.edges.verticalProfile[profIdx] * 0.4f;
-            }
+        // Count how many times we've seen this region before.
+        repeatCount = 0;
+        for (size_t prev = 0; prev < secIdx; ++prev) {
+            if (sections[prev].regionIdx == sec.regionIdx) ++repeatCount;
         }
-    }
 
-    // Deterministic pseudo-random for rests/variation (seeded from image).
-    u32 rng = static_cast<u32>(a.color.dominantHue * 100 + a.color.saturation * 1000);
-
-    i32 prevMidi = root + melodyOctave; // start on root
-    for (u32 i = 0; i < numNotes; ++i) {
-        rng = rng * 1664525u + 1013904223u;
-        f32 rval = static_cast<f32>(rng & 0xFFFF) / 65535.0f;
-
-        // Rest probability.
-        if (rval < restProb) continue;
-
-        // Target pitch from contour.
-        f32 targetNorm = pitchContour[i]; // 0–1
-        i32 targetMidi = root + melodyOctave + static_cast<i32>(targetNorm * 14.0f); // ~1 octave range
-
-        // Prefer stepwise motion: limit jump from previous note.
-        i32 maxJump = (style == CompStyle::Cinematic) ? 7 : 4;
-        if (targetMidi > prevMidi + maxJump) targetMidi = prevMidi + maxJump;
-        if (targetMidi < prevMidi - maxJump) targetMidi = prevMidi - maxJump;
-
-        // On strong beats (beat 0, 4, 8,...), prefer chord tones.
-        f32 beat = static_cast<f32>(i) * noteLen;
-        bool strongBeat = (std::fmod(beat, 4.0f) < 0.01f);
-
-        if (strongBeat && !chords.empty()) {
-            // Find current chord.
-            const ChordEvent* curChord = &chords[0];
-            for (auto& ch : chords) {
-                if (ch.startBeat <= beat) curChord = &ch;
-            }
-            // Find nearest chord tone.
-            i32 bestChordTone = targetMidi;
-            i32 bestDist = 999;
-            for (i32 cn : curChord->midiNotes) {
-                // Try the chord tone in the melody octave range.
-                for (int oct = -1; oct <= 2; ++oct) {
-                    i32 candidate = cn + oct * 12;
-                    i32 dist = std::abs(targetMidi - candidate);
-                    if (dist < bestDist) { bestDist = dist; bestChordTone = candidate; }
+        // Intro/Outro: sparse or no melody.
+        if (sec.type == SectionType::Intro) {
+            beat = sec.endBeat; // skip
+            continue;
+        }
+        if (sec.type == SectionType::Outro) {
+            // Sparse: just first few motif notes, fading.
+            auto it = regionMotifs.find(sec.regionIdx);
+            if (it != regionMotifs.end()) {
+                auto& m = it->second;
+                u32 notesToPlay = std::min(static_cast<u32>(m.intervals.size()), 3u);
+                for (u32 n = 0; n < notesToPlay && beat < sec.endBeat; ++n) {
+                    i32 midi = SnapMidiToScale(root + melodyOctave + m.intervals[n], root, scale);
+                    f32 dur = m.durations[n];
+                    if (beat + dur > sec.endBeat) dur = sec.endBeat - beat;
+                    f32 fadeVel = m.velocities[n] * (1.0f - (beat - sec.startBeat) / secLen) * 0.5f;
+                    melody.push_back({beat, dur * 0.85f, midi, std::clamp(fadeVel, 0.1f, 0.8f)});
+                    prevMidi = midi;
+                    beat += dur;
                 }
             }
-            targetMidi = bestChordTone;
+            continue;
         }
 
-        // Snap to scale.
-        targetMidi = SnapMidiToScale(targetMidi, root, scale);
+        // Breakdown: very sparse — one long note per 4 beats.
+        if (sec.type == SectionType::Breakdown) {
+            while (beat < sec.endBeat) {
+                const ChordEvent* curChord = nullptr;
+                for (auto& ch : chords)
+                    if (ch.startBeat <= beat) curChord = &ch;
+                i32 midi = curChord && !curChord->midiNotes.empty()
+                    ? SnapMidiToScale(curChord->midiNotes[0] + 12, root, scale)
+                    : root + melodyOctave;
+                f32 dur = std::min(4.0f, sec.endBeat - beat);
+                melody.push_back({beat, dur * 0.9f, midi, 0.25f});
+                prevMidi = midi;
+                beat += 4.0f;
+            }
+            continue;
+        }
 
-        NoteEvent ev;
-        ev.startBeat = beat;
-        ev.duration  = noteLen * 0.9f; // slight gap for articulation.
-        ev.midiNote  = targetMidi;
+        // Drop: silence at very start, then impactful notes.
+        if (sec.isDrop && beat == sec.startBeat) {
+            beat += 1.0f;  // silence gap for impact
+        }
 
-        // Velocity from brightness.
-        ev.velocity  = 0.5f + pitchContour[i] * 0.4f;
+        // ── Main motif-based melody generation ──────────────────────
+        auto it = regionMotifs.find(sec.regionIdx);
+        if (it == regionMotifs.end()) continue;
+        auto& motif = it->second;
 
-        melody.push_back(ev);
-        prevMidi = targetMidi;
+        // Fill section with motif repetitions + variations.
+        u32 phraseCount = 0;
+        while (beat < sec.endBeat) {
+            bool isAnswer = (phraseCount % 2 == 1);  // call-and-response
+            bool isVariation = (repeatCount > 0 || phraseCount > 1);
+
+            // Play motif notes.
+            for (u32 n = 0; n < motif.intervals.size() && beat < sec.endBeat; ++n) {
+                // Variation: transpose for repeats.
+                i32 transposeShift = 0;
+                if (isVariation) {
+                    // Shift by a scale degree or two.
+                    transposeShift = (repeatCount % 3 == 1) ? 2 : (repeatCount % 3 == 2) ? -2 : 0;
+                    if (isAnswer) transposeShift += (n == motif.intervals.size() - 1) ? -transposeShift : 0;
+                }
+
+                i32 interval = motif.intervals[n] + transposeShift;
+                i32 targetMidi = root + melodyOctave + interval;
+
+                // Section type affects register.
+                if (sec.type == SectionType::Chorus) targetMidi += 2;
+                if (sec.type == SectionType::Bridge) targetMidi -= 2;
+
+                // Constrain stepwise from previous.
+                if (targetMidi > prevMidi + 10) targetMidi = prevMidi + 10;
+                if (targetMidi < prevMidi - 10) targetMidi = prevMidi - 10;
+
+                // On strong beats, pull toward chord tone.
+                bool strongBeat = (std::fmod(beat, 4.0f) < 0.05f);
+                if (strongBeat) {
+                    const ChordEvent* curChord = nullptr;
+                    for (auto& ch : chords)
+                        if (ch.startBeat <= beat) curChord = &ch;
+                    if (curChord && !curChord->midiNotes.empty()) {
+                        i32 bestTone = targetMidi, bestDist = 999;
+                        for (i32 cn : curChord->midiNotes) {
+                            for (int oct = -1; oct <= 2; ++oct) {
+                                i32 cand = cn + oct * 12;
+                                i32 dist = std::abs(targetMidi - cand);
+                                if (dist < bestDist) { bestDist = dist; bestTone = cand; }
+                            }
+                        }
+                        targetMidi = bestTone;
+                    }
+                }
+
+                // Answer resolution: last note resolves to root.
+                if (isAnswer && n == motif.intervals.size() - 1) {
+                    targetMidi = SnapMidiToScale(root + melodyOctave, root, scale);
+                }
+
+                targetMidi = SnapMidiToScale(targetMidi, root, scale);
+
+                // Duration: occasional variation.
+                f32 dur = motif.durations[n];
+                if (isVariation && n % 3 == 0) {
+                    // Double-time or half-time occasionally.
+                    dur = (phraseCount % 3 == 1) ? dur * 0.5f : dur;
+                }
+                dur = QuantizeDuration(dur);
+                if (beat + dur > sec.endBeat) dur = sec.endBeat - beat;
+                if (dur < 0.125f) { beat = sec.endBeat; break; }
+
+                // Rests: based on edge density + section.
+                f32 t = beat / totalBeats;
+                f32 edgeHere = SampleProfile(a.edges.verticalProfile, t);
+                f32 restProb = restProbBase;
+                if (edgeHere < 0.05f) restProb += 0.25f;
+                if (sec.type == SectionType::Chorus) restProb *= 0.5f;  // fewer rests in chorus
+                if (sec.type == SectionType::PreChorus) restProb *= 0.7f;
+
+                if (RandF(rng) < restProb) {
+                    beat += dur;
+                    continue;
+                }
+
+                // Velocity from motif + section energy.
+                f32 vel = motif.velocities[n] * (0.5f + sec.energy * 0.5f);
+                // Build: crescendo within section.
+                if (sec.isBuild) {
+                    f32 secPos = (beat - sec.startBeat) / std::max(1.0f, secLen);
+                    vel *= (0.5f + 0.5f * secPos);
+                }
+                vel = std::clamp(vel, 0.15f, 1.0f);
+
+                // ── Chord-based lead: add harmony notes when image calls for it ──
+                NoteEvent ev{beat, dur * 0.88f, targetMidi, vel, {}};
+
+                // Sample local image saturation at this position.
+                f32 localSat = 0.0f;
+                {
+                    f32 posT = beat / totalBeats;
+                    u32 px = static_cast<u32>(posT * img.Width());
+                    if (px >= img.Width()) px = img.Width() - 1;
+                    u32 pw = std::max(1u, img.Width() / 32u);
+                    if (px + pw > img.Width()) pw = img.Width() - px;
+                    auto col = img.AverageColor(px, 0, pw, img.Height());
+                    auto lhsb = ToHSB(col[0], col[1], col[2]);
+                    localSat = lhsb[1];
+                }
+
+                // Chord lead probability from section + image + beat.
+                f32 chordProb = localSat * 0.4f;
+                if (sec.type == SectionType::Chorus || sec.type == SectionType::Drop)
+                    chordProb += 0.35f;
+                else if (sec.type == SectionType::PreChorus)
+                    chordProb += 0.20f;
+                else if (sec.type == SectionType::Verse)
+                    chordProb += 0.05f;
+                if (strongBeat)      chordProb += 0.15f;
+                if (dur >= 1.0f)     chordProb += 0.15f;
+                if (style == CompStyle::Ethereal || style == CompStyle::Cinematic)
+                    chordProb += 0.15f;
+                if (style == CompStyle::Rhythmic)
+                    chordProb -= 0.10f;
+                chordProb = std::clamp(chordProb, 0.0f, 0.80f);
+
+                if (RandF(rng) < chordProb) {
+                    if (localSat > 0.55f &&
+                        (sec.type == SectionType::Chorus || sec.type == SectionType::Drop)) {
+                        // Rich: third + fifth.
+                        ev.harmonize.push_back(
+                            SnapMidiToScale(targetMidi + 4, root, scale));
+                        if (dur >= 1.0f)
+                            ev.harmonize.push_back(
+                                SnapMidiToScale(targetMidi + 7, root, scale));
+                    } else if (localSat > 0.35f) {
+                        // Medium: fifth or octave.
+                        ev.harmonize.push_back(dur >= 1.5f
+                            ? SnapMidiToScale(targetMidi + 7, root, scale)
+                            : targetMidi + 12);
+                    } else {
+                        // Light: octave doubling.
+                        ev.harmonize.push_back(targetMidi + 12);
+                    }
+                    // More legato for chord passages.
+                    ev.duration = dur * 0.94f;
+                }
+
+                melody.push_back(ev);
+                prevMidi = targetMidi;
+                beat += dur;
+            }
+
+            // Breath between phrases.
+            beat += (style == CompStyle::Ethereal || style == CompStyle::Cinematic)
+                  ? 1.0f : 0.25f;
+            ++phraseCount;
+        }
     }
 
     return melody;
 }
 
-// ── Build bass line ─────────────────────────────────────────────────────────
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BuildBass — section-aware: sustained in verse, punchy in chorus
+// ═══════════════════════════════════════════════════════════════════════════
 
 std::vector<NoteEvent> ImageComposer::BuildBass(
-    const std::vector<ChordEvent>& chords, f32 totalBeats, CompStyle style)
+    const ImageData& img, const ImageAnalysis& a,
+    const std::vector<ChordEvent>& chords,
+    i32 root, const std::vector<i32>& scale, f32 totalBeats, CompStyle style)
 {
     std::vector<NoteEvent> bass;
-    if (chords.empty()) return bass;
+    if (chords.empty() || !img.IsLoaded()) return bass;
+
+    auto sections = BuildStructure(img, a, totalBeats, style);
 
     for (auto& chord : chords) {
         if (chord.midiNotes.empty()) continue;
 
-        // Root note in bass register (2 octaves below chord root).
+        // Find which section this chord belongs to.
+        const Section* sec = SectionAt(sections, chord.startBeat);
+
         i32 bassRoot = chord.midiNotes[0] - 24;
-        // Clamp to reasonable bass range.
         while (bassRoot < 28) bassRoot += 12;
         while (bassRoot > 55) bassRoot -= 12;
+        i32 fifth = SnapMidiToScale(bassRoot + 7, root, scale);
+        i32 third = SnapMidiToScale(bassRoot + 4, root, scale);
+        while (third > bassRoot + 12) third -= 12;
 
-        i32 fifth = bassRoot + 7;
-
-        switch (style) {
-        case CompStyle::Ethereal:
-        case CompStyle::Cinematic: {
-            // Sustained bass drone — one note per chord.
-            NoteEvent ev;
-            ev.startBeat = chord.startBeat;
-            ev.duration  = chord.duration * 0.95f;
-            ev.midiNote  = bassRoot;
-            ev.velocity  = chord.velocity * 0.7f;
-            bass.push_back(ev);
-            break;
-        }
-        case CompStyle::Harmonic: {
-            // Walking bass: root – 3rd – 5th – approach.
-            f32 stepLen = chord.duration / 4.0f;
-            i32 third = bassRoot + (chord.midiNotes.size() >= 2 ?
-                (chord.midiNotes[1] - chord.midiNotes[0]) : 4);
-            // Normalize third to bass octave.
-            while (third > bassRoot + 12) third -= 12;
-            while (third < bassRoot) third += 12;
-
-            i32 walk[] = {bassRoot, third, fifth, bassRoot + 12};
-            for (int j = 0; j < 4; ++j) {
-                NoteEvent ev;
-                ev.startBeat = chord.startBeat + j * stepLen;
-                ev.duration  = stepLen * 0.85f;
-                ev.midiNote  = walk[j];
-                ev.velocity  = chord.velocity * (j == 0 ? 0.8f : 0.6f);
-                bass.push_back(ev);
+        // Section-based activity level.
+        float activity;
+        if (!sec) {
+            activity = 0.5f;
+        } else {
+            switch (sec->type) {
+            case SectionType::Intro:     activity = 0.1f; break;
+            case SectionType::Verse:     activity = 0.35f; break;
+            case SectionType::PreChorus: activity = 0.5f; break;
+            case SectionType::Chorus:    activity = 0.75f; break;
+            case SectionType::Bridge:    activity = 0.3f; break;
+            case SectionType::Drop:      activity = 0.9f; break;
+            case SectionType::Breakdown: activity = 0.1f; break;
+            case SectionType::Outro:     activity = 0.25f; break;
             }
-            break;
+            // Image modulation.
+            f32 t = chord.startBeat / totalBeats;
+            f32 edgeAct = SampleProfile(a.edges.verticalProfile, t);
+            activity = activity * 0.6f + edgeAct * 0.4f;
+
+            if (style == CompStyle::Ethereal || style == CompStyle::Cinematic)
+                activity = std::min(activity, 0.4f);
+            if (style == CompStyle::Rhythmic)
+                activity = std::max(activity, 0.4f);
         }
-        case CompStyle::Rhythmic: {
-            // Synth bass: 8th note octave pattern (root, root+12, root, root+12...).
+
+        if (activity < 0.15f) {
+            // Near-silence (intro/breakdown): one quiet sustained note.
+            bass.push_back({chord.startBeat, chord.duration * 0.9f, bassRoot,
+                            chord.velocity * 0.3f});
+        } else if (activity < 0.35f) {
+            // Sustained root.
+            bass.push_back({chord.startBeat, chord.duration * 0.95f, bassRoot,
+                            chord.velocity * 0.6f});
+        } else if (activity < 0.5f) {
+            // Root + fifth.
+            f32 half = chord.duration / 2.0f;
+            bass.push_back({chord.startBeat, half * 0.9f, bassRoot, chord.velocity * 0.7f});
+            bass.push_back({chord.startBeat + half, half * 0.9f, fifth, chord.velocity * 0.55f});
+        } else if (activity < 0.7f) {
+            // Walking: root – 3rd – 5th – approach.
+            f32 step = chord.duration / 4.0f;
+            i32 approach = SnapMidiToScale(bassRoot - 1, root, scale);
+            i32 walk[] = { bassRoot, third, fifth, approach };
+            for (int j = 0; j < 4; ++j) {
+                f32 bStart = chord.startBeat + j * step;
+                if (bStart >= chord.startBeat + chord.duration) break;
+                bass.push_back({bStart, step * 0.8f, walk[j],
+                                chord.velocity * (j == 0 ? 0.75f : 0.55f)});
+            }
+        } else {
+            // Punchy 8th-note pattern (chorus/drop).
             f32 stepLen = 0.5f;
             u32 steps = static_cast<u32>(chord.duration / stepLen);
             for (u32 j = 0; j < steps; ++j) {
-                NoteEvent ev;
-                ev.startBeat = chord.startBeat + j * stepLen;
-                ev.duration  = stepLen * 0.7f;
-                ev.midiNote  = (j % 2 == 0) ? bassRoot : bassRoot + 12;
-                ev.velocity  = (j % 2 == 0) ? chord.velocity * 0.85f : chord.velocity * 0.55f;
-                bass.push_back(ev);
+                f32 bStart = chord.startBeat + j * stepLen;
+                f32 t2 = bStart / totalBeats;
+                f32 subEdge = SampleProfile(a.edges.verticalProfile, t2);
+                i32 note = (j % 2 == 0) ? bassRoot
+                         : (subEdge > 0.3f ? fifth : bassRoot + 12);
+                f32 vel = (j % 2 == 0) ? chord.velocity * 0.8f : chord.velocity * 0.5f;
+                bass.push_back({bStart, stepLen * 0.7f, note, vel});
             }
-            break;
-        }
-        case CompStyle::Melodic:
-        default: {
-            // Root on beat 1, fifth on beat 3.
-            f32 half = chord.duration / 2.0f;
-            {
-                NoteEvent ev;
-                ev.startBeat = chord.startBeat;
-                ev.duration  = half * 0.9f;
-                ev.midiNote  = bassRoot;
-                ev.velocity  = chord.velocity * 0.75f;
-                bass.push_back(ev);
-            }
-            {
-                NoteEvent ev;
-                ev.startBeat = chord.startBeat + half;
-                ev.duration  = half * 0.9f;
-                ev.midiNote  = fifth;
-                ev.velocity  = chord.velocity * 0.6f;
-                bass.push_back(ev);
-            }
-            break;
-        }
         }
     }
 
     return bass;
 }
 
-// ── Build drum pattern ──────────────────────────────────────────────────────
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BuildDrums — section-aware density with fills at transitions
+// ═══════════════════════════════════════════════════════════════════════════
 
 std::vector<DrumHit> ImageComposer::BuildDrums(
-    const ImageAnalysis& a, f32 totalBeats, CompStyle style)
+    const ImageData& img, const ImageAnalysis& a, f32 totalBeats, CompStyle style)
 {
     std::vector<DrumHit> drums;
+    if (!img.IsLoaded()) return drums;
 
-    // Base density from image.
-    f32 density = a.edges.density * 0.5f + a.texture.roughness * 0.5f;
+    auto sections = BuildStructure(img, a, totalBeats, style);
 
+    // Resolution per step.
+    f32 resolution;
     switch (style) {
-    case CompStyle::Ethereal: {
-        // Very sparse — occasional soft hi-hat.
-        for (f32 b = 0; b < totalBeats; b += 2.0f) {
-            if (density > 0.3f) {
-                drums.push_back({b, DrumType::HiHat, 0.2f});
+    case CompStyle::Ethereal:  resolution = 1.0f;  break;
+    case CompStyle::Cinematic: resolution = 1.0f;  break;
+    case CompStyle::Harmonic:  resolution = 0.5f;  break;
+    case CompStyle::Melodic:   resolution = 0.5f;  break;
+    case CompStyle::Rhythmic:  resolution = 0.25f; break;
+    default:                   resolution = 0.5f;  break;
+    }
+
+    u32 numSteps = static_cast<u32>(totalBeats / resolution);
+
+    for (u32 s = 0; s < numSteps; ++s) {
+        f32 beat = s * resolution;
+        f32 t = beat / totalBeats;
+
+        const Section* sec = SectionAt(sections, beat);
+        if (!sec) continue;
+
+        f32 secLen = sec->endBeat - sec->startBeat;
+        f32 secPos = (beat - sec->startBeat) / std::max(1.0f, secLen);
+
+        // ── Section-based thresholds ────────────────────────────────
+        f32 kickTh, snareTh, hatTh, densityMul;
+
+        switch (sec->type) {
+        case SectionType::Intro:
+            kickTh = 0.85f; snareTh = 0.95f; hatTh = 0.60f; densityMul = 0.3f; break;
+        case SectionType::Verse:
+            kickTh = 0.45f; snareTh = 0.55f; hatTh = 0.25f; densityMul = 0.6f; break;
+        case SectionType::PreChorus:
+            kickTh = 0.40f; snareTh = 0.45f; hatTh = 0.15f; densityMul = 0.75f; break;
+        case SectionType::Chorus:
+            kickTh = 0.25f; snareTh = 0.30f; hatTh = 0.08f; densityMul = 1.0f; break;
+        case SectionType::Bridge:
+            kickTh = 0.55f; snareTh = 0.65f; hatTh = 0.30f; densityMul = 0.5f; break;
+        case SectionType::Drop:
+            kickTh = 0.20f; snareTh = 0.25f; hatTh = 0.05f; densityMul = 1.1f; break;
+        case SectionType::Breakdown:
+            kickTh = 0.90f; snareTh = 0.95f; hatTh = 0.70f; densityMul = 0.15f; break;
+        case SectionType::Outro:
+            kickTh = 0.50f; snareTh = 0.60f; hatTh = 0.30f; densityMul = 0.5f; break;
+        default:
+            kickTh = 0.40f; snareTh = 0.50f; hatTh = 0.20f; densityMul = 0.7f; break;
+        }
+
+        // Style scaling.
+        if (style == CompStyle::Ethereal || style == CompStyle::Cinematic) {
+            kickTh += 0.15f; snareTh += 0.15f; hatTh += 0.15f;
+        }
+        if (style == CompStyle::Rhythmic) {
+            kickTh -= 0.10f; snareTh -= 0.10f; hatTh -= 0.05f;
+        }
+
+        // Build: increasing density through section.
+        if (sec->isBuild) {
+            f32 buildFactor = secPos * 0.3f;
+            kickTh -= buildFactor;
+            snareTh -= buildFactor;
+            hatTh -= buildFactor;
+        }
+
+        // Drop: silence at start, then full.
+        if (sec->isDrop && secPos < 0.1f) {
+            continue; // no drums during drop silence
+        }
+
+        // Edge data drives the pattern.
+        f32 edgeV = SampleProfile(a.edges.verticalProfile, t);
+        f32 edgeH = SampleProfile(a.edges.horizontalProfile, t);
+
+        // Musical position.
+        f32 beatPhase4 = std::fmod(beat, 4.0f);
+        bool isDownbeat = (beatPhase4 < 0.05f);
+        bool isBackbeat = (std::abs(beatPhase4 - 2.0f) < 0.05f);
+
+        f32 kickScore  = edgeV * densityMul + (isDownbeat ? 0.2f : 0.0f);
+        f32 snareScore = edgeH * densityMul + (isBackbeat ? 0.15f : 0.0f);
+        f32 hatScore   = (edgeV + edgeH) * 0.5f * densityMul;
+
+        // Kick.
+        if (kickScore > kickTh) {
+            f32 vel = std::clamp(kickScore * 1.1f, 0.3f, 1.0f);
+            drums.push_back({beat, DrumType::Kick, vel});
+        }
+
+        // Snare.
+        if (snareScore > snareTh && (kickScore <= kickTh || snareScore > 0.7f)) {
+            f32 vel = std::clamp(snareScore, 0.25f, 0.85f);
+            drums.push_back({beat, DrumType::Snare, vel});
+        }
+
+        // Hi-hat.
+        if (hatScore > hatTh) {
+            f32 vel = std::clamp(hatScore * 0.6f, 0.1f, 0.5f);
+            DrumType type = (edgeV > 0.7f && edgeH > 0.5f)
+                          ? DrumType::OpenHat : DrumType::HiHat;
+            drums.push_back({beat, type, vel});
+        }
+    }
+
+    // ── Transition fills: drum roll at end of each section ──────────
+    for (size_t si = 0; si + 1 < sections.size(); ++si) {
+        auto& sec = sections[si];
+        // Only add fill if going into chorus/drop or if it's a build.
+        auto nextType = sections[si + 1].type;
+        bool needsFill = (nextType == SectionType::Chorus || nextType == SectionType::Drop)
+                       || sec.isBuild;
+        if (!needsFill) continue;
+
+        // Fill: last 2 beats of section, accelerating snare hits.
+        f32 fillStart = sec.endBeat - 2.0f;
+        if (fillStart < sec.startBeat) fillStart = sec.startBeat;
+
+        f32 fillRes = 0.25f;
+        for (f32 fb = fillStart; fb < sec.endBeat; fb += fillRes) {
+            f32 intensity = (fb - fillStart) / 2.0f;  // 0 to 1
+            f32 vel = 0.3f + intensity * 0.5f;
+            drums.push_back({fb, DrumType::Snare, vel});
+            // Add kick on last hit for impact.
+            if (fb + fillRes >= sec.endBeat)
+                drums.push_back({fb, DrumType::Kick, 0.9f});
+        }
+    }
+
+    // Ensure minimal pulse in chorus/verse sections.
+    for (auto& sec : sections) {
+        if (sec.type == SectionType::Chorus || sec.type == SectionType::Verse) {
+            for (f32 b = sec.startBeat; b < sec.endBeat; b += 4.0f) {
+                bool hasKick = false;
+                for (auto& d : drums) {
+                    if (std::abs(d.beat - b) < 0.1f && d.type == DrumType::Kick) {
+                        hasKick = true; break;
+                    }
+                }
+                if (!hasKick) drums.push_back({b, DrumType::Kick, 0.3f});
             }
         }
-        break;
-    }
-    case CompStyle::Cinematic: {
-        // Occasional deep kick on beat 1 of each 4-bar section.
-        for (f32 b = 0; b < totalBeats; b += 16.0f) {
-            drums.push_back({b, DrumType::Kick, 0.7f});
-        }
-        // Sparse snare rolls at climax points.
-        if (density > 0.5f) {
-            f32 mid = totalBeats * 0.5f;
-            drums.push_back({mid, DrumType::Snare, 0.5f});
-        }
-        break;
-    }
-    case CompStyle::Rhythmic: {
-        // Full kit: kick on 1,3; snare on 2,4; hi-hat on 8ths or 16ths.
-        for (f32 b = 0; b < totalBeats; b += 4.0f) {
-            drums.push_back({b,        DrumType::Kick,  0.8f});
-            drums.push_back({b + 2.0f, DrumType::Kick,  0.6f});
-            drums.push_back({b + 1.0f, DrumType::Snare, 0.7f});
-            drums.push_back({b + 3.0f, DrumType::Snare, 0.65f});
-
-            // If high density, add ghost kicks.
-            if (density > 0.5f) {
-                drums.push_back({b + 2.5f, DrumType::Kick, 0.35f});
-            }
-        }
-
-        // Hi-hat pattern.
-        f32 hatStep = (density > 0.6f) ? 0.25f : 0.5f;
-        for (f32 b = 0; b < totalBeats; b += hatStep) {
-            bool isOffbeat = (std::fmod(b, 1.0f) > 0.01f);
-            f32 vel = isOffbeat ? 0.3f : 0.5f;
-            // Occasional open hat on "and" of 2 and 4.
-            bool openHat = (std::fmod(b - 1.5f, 4.0f) < 0.01f || std::fmod(b - 3.5f, 4.0f) < 0.01f);
-            drums.push_back({b, openHat ? DrumType::OpenHat : DrumType::HiHat, vel});
-        }
-        break;
-    }
-    case CompStyle::Harmonic: {
-        // Moderate: kick on 1, snare on 3, hi-hat on 8ths.
-        for (f32 b = 0; b < totalBeats; b += 4.0f) {
-            drums.push_back({b,        DrumType::Kick,  0.6f});
-            drums.push_back({b + 2.0f, DrumType::Snare, 0.45f});
-        }
-        for (f32 b = 0; b < totalBeats; b += 0.5f) {
-            f32 vel = (std::fmod(b, 1.0f) < 0.01f) ? 0.35f : 0.2f;
-            drums.push_back({b, DrumType::HiHat, vel});
-        }
-        break;
-    }
-    case CompStyle::Melodic:
-    default: {
-        // Light: just hi-hat and gentle kick.
-        for (f32 b = 0; b < totalBeats; b += 4.0f) {
-            drums.push_back({b, DrumType::Kick, 0.4f});
-        }
-        for (f32 b = 0; b < totalBeats; b += 1.0f) {
-            drums.push_back({b, DrumType::HiHat, 0.25f});
-        }
-        break;
-    }
     }
 
-    // Sort by beat time.
     std::sort(drums.begin(), drums.end(),
-        [](const DrumHit& a, const DrumHit& b) { return a.beat < b.beat; });
+        [](const DrumHit& x, const DrumHit& y) { return x.beat < y.beat; });
 
     return drums;
 }
+
 
 // ═══════════════════════════════════════════════════════════════════════════
 // MusicRenderer
@@ -591,32 +1257,106 @@ f32 MusicRenderer::Noise() {
     return static_cast<f32>(rng_ & 0xFFFF) / 32768.0f - 1.0f;
 }
 
+
 // ── Event triggering ────────────────────────────────────────────────────────
 
 void MusicRenderer::TriggerMelody(const NoteEvent& n) {
-    // Find the least-active voice.
+    f32 newFreq = MidiToFreq(static_cast<f32>(n.midiNote));
+    f32 durSamples = n.duration * 60.0f / (comp_.tempo * tempoScale_) * sampleRate_;
+    f32 releaseTime = comp_.melodyRelease;
+
+    // Legato/portamento: if a voice is active and note is close, glide instead of retrigger.
+    if (comp_.portamentoRate > 0.01f) {
+        for (auto& v : melodyVoices_) {
+            if (v.active && v.envStage != Release) {
+                i32 interval = std::abs(n.midiNote - static_cast<i32>(
+                    std::round(12.0f * std::log2(v.freq / 440.0f) + 69.0f)));
+                if (interval <= 7) {
+                    // Legato: glide to new note.
+                    v.targetFreq  = newFreq;
+                    v.glideRate   = 1.0f / (comp_.portamentoRate * 0.1f * sampleRate_);
+                    v.amp         = n.velocity;
+                    v.samplesLeft = static_cast<u32>(durSamples);
+                    v.envStage    = Sustain;
+
+                    // Glide harmony voices too.
+                    u32 hIdx = 0;
+                    for (auto& hv : melodyVoices_) {
+                        if (&hv == &v) continue;
+                        if (hIdx < n.harmonize.size() && hv.active && hv.envStage != Release) {
+                            f32 hFreq = MidiToFreq(static_cast<f32>(n.harmonize[hIdx]));
+                            hv.targetFreq  = hFreq;
+                            hv.glideRate   = v.glideRate;
+                            hv.amp         = n.velocity * 0.65f;
+                            hv.samplesLeft = static_cast<u32>(durSamples);
+                            hv.envStage    = Sustain;
+                            ++hIdx;
+                        }
+                    }
+                    // Release leftover harmony voices if chord shrunk.
+                    return;
+                }
+            }
+        }
+    }
+
+    // Normal trigger: find quietest voice for primary note.
     Voice* best = &melodyVoices_[0];
     for (auto& v : melodyVoices_) {
         if (!v.active) { best = &v; break; }
         if (v.envLevel < best->envLevel) best = &v;
     }
-    best->active     = true;
-    best->freq       = MidiToFreq(static_cast<f32>(n.midiNote));
-    best->amp        = n.velocity;
-    best->phase      = 0;
-    best->phase2     = 0;
-    best->envLevel   = 0;
-    best->envStage   = Attack;
+    best->active      = true;
+    best->freq        = newFreq;
+    best->targetFreq  = newFreq;
+    best->glideRate   = 0;
+    best->amp         = n.velocity;
+    best->phase       = 0;
+    best->phase2      = 0;
+    best->envLevel    = 0;
+    best->envStage    = Attack;
     best->attackRate  = 1.0f / (comp_.melodyAttack * sampleRate_);
-    best->releaseRate = 1.0f / (0.3f * sampleRate_);
-    best->samplesLeft = static_cast<u32>(n.duration * 60.0f / (comp_.tempo * tempoScale_) * sampleRate_);
-    best->pan         = 0.0f; // melody centered.
+    best->releaseRate = 1.0f / (releaseTime * sampleRate_);
+    best->samplesLeft = static_cast<u32>(durSamples);
+    best->pan         = 0.0f;
     best->filterState = 0;
+
+    // Trigger additional voices for harmony notes (chord lead).
+    for (size_t h = 0; h < n.harmonize.size(); ++h) {
+        Voice* hv = nullptr;
+        for (auto& v : melodyVoices_) {
+            if (&v == best) continue; // skip primary
+            if (!v.active) { hv = &v; break; }
+        }
+        if (!hv) {
+            // Steal quietest non-primary voice.
+            hv = nullptr;
+            for (auto& v : melodyVoices_) {
+                if (&v == best) continue;
+                if (!hv || v.envLevel < hv->envLevel) hv = &v;
+            }
+        }
+        if (!hv) break;
+
+        f32 hFreq = MidiToFreq(static_cast<f32>(n.harmonize[h]));
+        hv->active      = true;
+        hv->freq        = hFreq;
+        hv->targetFreq  = hFreq;
+        hv->glideRate   = 0;
+        hv->amp         = n.velocity * 0.6f; // harmony slightly quieter
+        hv->phase       = 0.1 * static_cast<f64>(h + 1); // slight phase offset for width
+        hv->phase2      = 0;
+        hv->envLevel    = 0;
+        hv->envStage    = Attack;
+        hv->attackRate  = 1.0f / (std::max(comp_.melodyAttack, 0.02f) * sampleRate_);
+        hv->releaseRate = 1.0f / (releaseTime * 1.2f * sampleRate_);
+        hv->samplesLeft = static_cast<u32>(durSamples);
+        hv->pan         = (h == 0) ? -0.25f : 0.25f; // slight stereo spread
+        hv->filterState = 0;
+    }
 }
 
 void MusicRenderer::TriggerChord(const ChordEvent& c) {
-    // Assign one voice per chord note, releasing old ones.
-    // First, set all active chord voices to release.
     for (auto& v : chordVoices_) {
         if (v.active && v.envStage != Release) v.envStage = Release;
     }
@@ -625,31 +1365,31 @@ void MusicRenderer::TriggerChord(const ChordEvent& c) {
     for (i32 midiNote : c.midiNotes) {
         if (voiceIdx >= kChordVoices) break;
 
-        // Find a free or releasing voice.
         Voice* best = nullptr;
         for (auto& v : chordVoices_) {
             if (!v.active) { best = &v; break; }
         }
         if (!best) {
-            // Steal the one with lowest envelope.
             best = &chordVoices_[0];
             for (auto& v : chordVoices_) {
                 if (v.envLevel < best->envLevel) best = &v;
             }
         }
 
+        f32 freq = MidiToFreq(static_cast<f32>(midiNote));
         best->active      = true;
-        best->freq        = MidiToFreq(static_cast<f32>(midiNote));
+        best->freq        = freq;
+        best->targetFreq  = freq;
+        best->glideRate   = 0;
         best->amp         = c.velocity;
         best->phase       = 0;
-        best->phase2      = 0.3; // offset for detuned 2nd osc.
+        best->phase2      = 0.3;
         best->envLevel    = 0;
         best->envStage    = Attack;
         best->attackRate  = 1.0f / (comp_.padAttack * sampleRate_);
         best->releaseRate = 1.0f / (1.0f * sampleRate_);
         best->samplesLeft = static_cast<u32>(c.duration * 60.0f / (comp_.tempo * tempoScale_) * sampleRate_);
 
-        // Spread chord voices in stereo.
         f32 spread = static_cast<f32>(voiceIdx) / static_cast<f32>(c.midiNotes.size());
         best->pan = (spread - 0.5f) * 2.0f * stereoWidth_;
         best->filterState = 0;
@@ -663,8 +1403,11 @@ void MusicRenderer::TriggerBass(const NoteEvent& n) {
         if (!v.active) { best = &v; break; }
         if (v.envLevel < best->envLevel) best = &v;
     }
+    f32 freq = MidiToFreq(static_cast<f32>(n.midiNote));
     best->active      = true;
-    best->freq        = MidiToFreq(static_cast<f32>(n.midiNote));
+    best->freq        = freq;
+    best->targetFreq  = freq;
+    best->glideRate   = 0;
     best->amp         = n.velocity;
     best->phase       = 0;
     best->envLevel    = 0;
@@ -672,18 +1415,16 @@ void MusicRenderer::TriggerBass(const NoteEvent& n) {
     best->attackRate  = 1.0f / (0.01f * sampleRate_);
     best->releaseRate = 1.0f / (0.15f * sampleRate_);
     best->samplesLeft = static_cast<u32>(n.duration * 60.0f / (comp_.tempo * tempoScale_) * sampleRate_);
-    best->pan         = 0; // bass centered.
+    best->pan         = 0;
     best->filterState = 0;
 }
 
 void MusicRenderer::TriggerDrum(const DrumHit& h) {
-    // Find a free drum voice.
     DrumVoice* best = nullptr;
     for (auto& v : drumVoices_) {
         if (!v.active) { best = &v; break; }
     }
     if (!best) {
-        // Steal oldest (lowest env).
         best = &drumVoices_[0];
         for (auto& v : drumVoices_) {
             if (v.env < best->env) best = &v;
@@ -697,10 +1438,16 @@ void MusicRenderer::TriggerDrum(const DrumHit& h) {
     best->filterState = 0;
 }
 
-// ── Voice update ────────────────────────────────────────────────────────────
+
+// ── Voice envelope ──────────────────────────────────────────────────────────
 
 void MusicRenderer::UpdateVoice(Voice& v) {
     if (!v.active) return;
+
+    // Portamento frequency glide.
+    if (v.glideRate > 0 && std::abs(v.freq - v.targetFreq) > 0.01f) {
+        v.freq += (v.targetFreq - v.freq) * v.glideRate;
+    }
 
     switch (v.envStage) {
     case Attack:
@@ -716,26 +1463,33 @@ void MusicRenderer::UpdateVoice(Voice& v) {
         break;
     default: break;
     }
-
     if (v.samplesLeft > 0) --v.samplesLeft;
 }
+
 
 // ── Voice rendering ─────────────────────────────────────────────────────────
 
 f32 MusicRenderer::RenderMelodyVoice(Voice& v) {
     if (!v.active) return 0;
 
-    // Additive saw-like: fundamental + 2 harmonics.
     f32 p = static_cast<f32>(v.phase);
-    f32 sample = std::sin(kTwoPI * p)
-               + 0.4f * std::sin(kTwoPI * 2.0f * p)
-               + 0.15f * std::sin(kTwoPI * 3.0f * p)
-               + 0.06f * std::sin(kTwoPI * 4.0f * p);
-    sample *= 0.5f; // normalize.
+    f32 sample = 0;
 
-    sample *= v.envLevel * v.amp;
+    auto& hp = comp_.harmonicProfile;
+    if (hp.empty()) {
+        sample = std::sin(kTwoPI * p);
+    } else {
+        for (u32 h = 0; h < static_cast<u32>(hp.size()); ++h) {
+            sample += hp[h] * std::sin(kTwoPI * static_cast<f32>(h + 1) * p);
+        }
+    }
 
-    // One-pole lowpass for brightness.
+    if (comp_.noiseBlend > 0.001f) {
+        sample = sample * (1.0f - comp_.noiseBlend) + Noise() * comp_.noiseBlend;
+    }
+
+    sample *= v.envLevel * v.amp * 0.4f;
+
     f32 cutoff = 0.1f + brightness_ * 0.7f;
     v.filterState += cutoff * (sample - v.filterState);
     sample = v.filterState;
@@ -750,33 +1504,40 @@ f32 MusicRenderer::RenderMelodyVoice(Voice& v) {
 void MusicRenderer::RenderChordVoice(Voice& v, f32& left, f32& right) {
     if (!v.active) return;
 
-    // Detuned pair of oscillators for warmth.
     f32 p1 = static_cast<f32>(v.phase);
     f32 p2 = static_cast<f32>(v.phase2);
 
-    // Soft saw-like via additive.
-    f32 s1 = std::sin(kTwoPI * p1)
-           + 0.35f * std::sin(kTwoPI * 2.0f * p1)
-           + 0.1f * std::sin(kTwoPI * 3.0f * p1);
-    f32 s2 = std::sin(kTwoPI * p2)
-           + 0.35f * std::sin(kTwoPI * 2.0f * p2)
-           + 0.1f * std::sin(kTwoPI * 3.0f * p2);
+    f32 s1 = 0, s2 = 0;
+    auto& hp = comp_.harmonicProfile;
+    if (hp.empty()) {
+        s1 = std::sin(kTwoPI * p1);
+        s2 = std::sin(kTwoPI * p2);
+    } else {
+        u32 numH = std::min(static_cast<u32>(hp.size()), 6u);
+        for (u32 h = 0; h < numH; ++h) {
+            f32 weight = hp[h] * (1.0f / static_cast<f32>(h + 1));
+            s1 += weight * std::sin(kTwoPI * static_cast<f32>(h + 1) * p1);
+            s2 += weight * std::sin(kTwoPI * static_cast<f32>(h + 1) * p2);
+        }
+    }
 
-    f32 sample = (s1 + s2) * 0.25f * v.envLevel * v.amp;
+    f32 sample = (s1 + s2) * 0.2f * v.envLevel * v.amp;
 
-    // Lowpass for warmth.
     f32 cutoff = 0.05f + brightness_ * 0.4f;
+    if (comp_.filterSweep > 0.001f) {
+        f32 lfo = std::sin(kTwoPI * static_cast<f32>(v.phase * 0.1));
+        cutoff += comp_.filterSweep * lfo * 0.1f;
+        cutoff = std::clamp(cutoff, 0.01f, 0.95f);
+    }
     v.filterState += cutoff * (sample - v.filterState);
     sample = v.filterState;
 
-    // Pan.
     f32 panL = std::cos((v.pan + 1.0f) * kHalfPI * 0.5f);
     f32 panR = std::sin((v.pan + 1.0f) * kHalfPI * 0.5f);
     left  += sample * panL;
     right += sample * panR;
 
-    // Advance with slight detune.
-    f32 detune = 1.003f; // ~5 cents.
+    f32 detune = 1.0f + comp_.detuneAmount;
     v.phase  += static_cast<f64>(v.freq) / sampleRate_;
     v.phase2 += static_cast<f64>(v.freq * detune) / sampleRate_;
     if (v.phase  >= 1.0) v.phase  -= 1.0;
@@ -788,16 +1549,22 @@ void MusicRenderer::RenderChordVoice(Voice& v, f32& left, f32& right) {
 f32 MusicRenderer::RenderBassVoice(Voice& v) {
     if (!v.active) return 0;
 
-    // Sine + subtle overtone for warmth.
     f32 p = static_cast<f32>(v.phase);
-    f32 sample = std::sin(kTwoPI * p)
-               + 0.2f * std::sin(kTwoPI * 2.0f * p)
-               + 0.05f * std::sin(kTwoPI * 3.0f * p);
-    sample *= 0.6f;
 
-    sample *= v.envLevel * v.amp;
+    f32 sample = 0;
+    auto& hp = comp_.harmonicProfile;
+    if (hp.empty()) {
+        sample = std::sin(kTwoPI * p);
+    } else {
+        u32 numH = std::min(static_cast<u32>(hp.size()), 4u);
+        for (u32 h = 0; h < numH; ++h) {
+            f32 weight = hp[h] * (1.0f / static_cast<f32>((h + 1) * (h + 1)));
+            sample += weight * std::sin(kTwoPI * static_cast<f32>(h + 1) * p);
+        }
+    }
 
-    // Heavy lowpass.
+    sample *= 0.6f * v.envLevel * v.amp;
+
     f32 cutoff = 0.08f + brightness_ * 0.15f;
     v.filterState += cutoff * (sample - v.filterState);
     sample = v.filterState;
@@ -817,38 +1584,34 @@ f32 MusicRenderer::RenderDrumVoice(DrumVoice& v) {
 
     switch (v.type) {
     case DrumType::Kick: {
-        // Pitch-dropping sine.
         f32 freq = 50.0f + 100.0f * v.env * v.env;
         sample = std::sin(kTwoPI * static_cast<f32>(v.phase)) * v.env;
         v.phase += static_cast<f64>(freq) / sampleRate_;
-        decayRate = 1.0f - 5.0f / sampleRate_;   // ~200ms decay.
+        decayRate = 1.0f - 5.0f / sampleRate_;
         break;
     }
     case DrumType::Snare: {
-        // Body (sine) + noise.
         f32 body = std::sin(kTwoPI * static_cast<f32>(v.phase)) * v.env * 0.5f;
         v.phase += 180.0 / sampleRate_;
         f32 noise = Noise() * v.env * 0.5f;
-        // Bandpass the noise via simple feedback.
         v.filterState += 0.3f * (noise - v.filterState);
         noise = noise - v.filterState;
         sample = body + noise;
-        decayRate = 1.0f - 7.0f / sampleRate_;   // ~140ms decay.
+        decayRate = 1.0f - 7.0f / sampleRate_;
         break;
     }
     case DrumType::HiHat: {
         f32 noise = Noise();
-        // High-pass via one-pole.
         v.filterState += 0.15f * (noise - v.filterState);
         sample = (noise - v.filterState) * v.env * 0.4f;
-        decayRate = 1.0f - 30.0f / sampleRate_;  // ~30ms decay (closed hat).
+        decayRate = 1.0f - 30.0f / sampleRate_;
         break;
     }
     case DrumType::OpenHat: {
         f32 noise = Noise();
         v.filterState += 0.15f * (noise - v.filterState);
         sample = (noise - v.filterState) * v.env * 0.35f;
-        decayRate = 1.0f - 5.0f / sampleRate_;   // ~200ms decay (open hat).
+        decayRate = 1.0f - 5.0f / sampleRate_;
         break;
     }
     }
@@ -859,6 +1622,7 @@ f32 MusicRenderer::RenderDrumVoice(DrumVoice& v) {
 
     return sample;
 }
+
 
 // ── Main render loop ────────────────────────────────────────────────────────
 
@@ -877,7 +1641,7 @@ void MusicRenderer::Process(SampleBuffer* output, u32 bufferSize) {
             nextDrum_   = 0;
         }
 
-        // ── Trigger events ──────────────────────────────────────────────
+        // ── Trigger events ──────────────────────────────────────────
         while (nextMelody_ < comp_.melody.size() &&
                comp_.melody[nextMelody_].startBeat <= loopBeat) {
             TriggerMelody(comp_.melody[nextMelody_]);
@@ -899,9 +1663,15 @@ void MusicRenderer::Process(SampleBuffer* output, u32 bufferSize) {
             ++nextDrum_;
         }
 
-        // ── Render all layers ───────────────────────────────────────────
-        f32 melSample = 0;
-        for (auto& v : melodyVoices_) melSample += RenderMelodyVoice(v);
+        // ── Render all layers ───────────────────────────────────────
+        f32 melL = 0, melR = 0;
+        for (auto& v : melodyVoices_) {
+            f32 s = RenderMelodyVoice(v);
+            f32 panL = std::cos((v.pan + 1.0f) * kHalfPI * 0.5f);
+            f32 panR = std::sin((v.pan + 1.0f) * kHalfPI * 0.5f);
+            melL += s * panL;
+            melR += s * panR;
+        }
 
         f32 chordL = 0, chordR = 0;
         for (auto& v : chordVoices_) RenderChordVoice(v, chordL, chordR);
@@ -912,27 +1682,33 @@ void MusicRenderer::Process(SampleBuffer* output, u32 bufferSize) {
         f32 drumSample = 0;
         for (auto& v : drumVoices_) drumSample += RenderDrumVoice(v);
 
-        // ── Mix ─────────────────────────────────────────────────────────
+        // ── Apply per-beat dynamics from section-aware map ──────────
+        f32 dynGain = 1.0f;
+        if (!comp_.dynamicMap.empty()) {
+            u32 beatIdx = static_cast<u32>(loopBeat);
+            if (beatIdx >= comp_.dynamicMap.size())
+                beatIdx = static_cast<u32>(comp_.dynamicMap.size()) - 1;
+            dynGain = comp_.dynamicMap[beatIdx];
+        }
+
+        // ── Mix ─────────────────────────────────────────────────────
+        f32 left  = melL       * comp_.melodyGain
+                  + chordL     * comp_.chordGain
+                  + bassSample * comp_.bassGain
+                  + drumSample * comp_.drumGain;
+        f32 right = melR       * comp_.melodyGain
+                  + chordR     * comp_.chordGain
+                  + bassSample * comp_.bassGain
+                  + drumSample * comp_.drumGain;
+
         f32 eg = energy_;
-        f32 left  = melSample * comp_.melodyGain
-                  + chordL    * comp_.chordGain
-                  + bassSample * comp_.bassGain
-                  + drumSample * comp_.drumGain;
-        f32 right = melSample * comp_.melodyGain
-                  + chordR    * comp_.chordGain
-                  + bassSample * comp_.bassGain
-                  + drumSample * comp_.drumGain;
+        left  *= (0.3f + eg * 0.7f) * dynGain;
+        right *= (0.3f + eg * 0.7f) * dynGain;
 
-        // Apply energy scaling.
-        left  *= (0.3f + eg * 0.7f);
-        right *= (0.3f + eg * 0.7f);
-
-        // Master lowpass for global warmth/brightness.
         f32 masterCutoff = 0.3f + brightness_ * 0.7f;
         masterFilterL_ += masterCutoff * (left  - masterFilterL_);
         masterFilterR_ += masterCutoff * (right - masterFilterR_);
 
-        // Soft-clip (tanh).
         left  = std::tanh(masterFilterL_ * 1.5f);
         right = std::tanh(masterFilterR_ * 1.5f);
 

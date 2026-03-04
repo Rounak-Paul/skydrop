@@ -19,6 +19,7 @@ struct NoteEvent {
     f32 duration;       ///< Duration in beats.
     i32 midiNote;       ///< MIDI note number.
     f32 velocity;       ///< 0–1 strength.
+    std::vector<i32> harmonize;  ///< Additional simultaneous notes (empty = single note).
 };
 
 struct ChordEvent {
@@ -32,6 +33,31 @@ struct DrumHit {
     f32 beat;           ///< Beat position.
     DrumType type;
     f32 velocity;
+};
+
+// ── Musical structure ────────────────────────────────────────────────────────
+
+enum class SectionType : u8 {
+    Intro, Verse, PreChorus, Chorus, Bridge, Drop, Breakdown, Outro
+};
+
+/// A structural section of the composition, inferred from image regions.
+struct Section {
+    SectionType type;
+    f32 startBeat;
+    f32 endBeat;
+    f32 energy;           ///< [0,1] drives layer intensity.
+    f32 avgBrightness;    ///< Section-local brightness.
+    u32 regionIdx;        ///< Image vertical region index (for motif reuse).
+    bool isBuild;         ///< Crescendo toward next section.
+    bool isDrop;          ///< Sudden entrance after silence.
+};
+
+/// A short melodic phrase extracted from an image region.
+struct Motif {
+    std::vector<i32> intervals;   ///< Pitch intervals from section root (semitones).
+    std::vector<f32> durations;   ///< Note durations in beats.
+    std::vector<f32> velocities;  ///< Per-note velocity.
 };
 
 // ── Composition style ───────────────────────────────────────────────────────
@@ -68,6 +94,20 @@ struct Composition {
     f32 drumGain     = 0.15f;
     f32 padAttack    = 0.3f;        ///< Chord voice attack in seconds.
     f32 melodyAttack = 0.01f;       ///< Melody voice attack in seconds.
+
+    // Image-derived timbre.
+    std::vector<f32> harmonicProfile;   ///< Overtone amplitude weights (index 0 = fundamental).
+    std::vector<f32> dynamicMap;        ///< Per-beat intensity from image brightness scan.
+    f32 detuneAmount  = 0.003f;         ///< Oscillator detune (from color complexity).
+    f32 noiseBlend    = 0.0f;           ///< Noise mixed into timbre (from texture roughness).
+    f32 filterSweep   = 0.0f;           ///< Filter LFO depth (from texture regularity).
+
+    // Musical structure.
+    std::vector<Section> sections;      ///< Song sections (intro, verse, chorus, etc.).
+    std::vector<Motif> motifs;          ///< One motif per unique image region.
+    f32 portamentoRate = 0.0f;          ///< Melody glide speed (0 = none, 1 = slow).
+    f32 leadChordiness = 0.0f;          ///< 0–1 how often lead plays chords vs single notes.
+    f32 melodyRelease  = 0.3f;          ///< Melody voice release time in seconds.
 };
 
 // ── ImageComposer ───────────────────────────────────────────────────────────
@@ -82,7 +122,16 @@ private:
     static f32  DeriveTempo(const ImageAnalysis& a, CompStyle style);
     static i32  DeriveRootNote(const ImageAnalysis& a);
     static const std::vector<i32>* DeriveScale(const ImageAnalysis& a);
-    static u32  SelectProgression(const ImageAnalysis& a, bool isMajor);
+
+    static std::vector<f32> BuildHarmonicProfile(const ImageAnalysis& a);
+    static std::vector<f32> BuildDynamicMap(const ImageData& img,
+        const std::vector<Section>& sections, f32 totalBeats);
+
+    static std::vector<Section> BuildStructure(
+        const ImageData& img, const ImageAnalysis& a, f32 totalBeats, CompStyle style);
+    static Motif ExtractMotif(
+        const ImageData& img, u32 x, u32 w,
+        i32 root, const std::vector<i32>& scale, CompStyle style, u32& rng);
 
     static std::vector<ChordEvent> BuildChords(
         const ImageData& img, const ImageAnalysis& a,
@@ -94,10 +143,12 @@ private:
         i32 root, const std::vector<i32>& scale, f32 totalBeats, CompStyle style);
 
     static std::vector<NoteEvent> BuildBass(
-        const std::vector<ChordEvent>& chords, f32 totalBeats, CompStyle style);
+        const ImageData& img, const ImageAnalysis& a,
+        const std::vector<ChordEvent>& chords,
+        i32 root, const std::vector<i32>& scale, f32 totalBeats, CompStyle style);
 
     static std::vector<DrumHit> BuildDrums(
-        const ImageAnalysis& a, f32 totalBeats, CompStyle style);
+        const ImageData& img, const ImageAnalysis& a, f32 totalBeats, CompStyle style);
 };
 
 // ── MusicRenderer ───────────────────────────────────────────────────────────
@@ -134,6 +185,8 @@ private:
         u32      samplesLeft = 0;   ///< Samples until release.
         f32      pan = 0;           ///< -1 left, +1 right.
         f32      filterState = 0;
+        f32      targetFreq = 0;    ///< Portamento target.
+        f32      glideRate = 0;     ///< Per-sample freq smoothing.
     };
 
     struct DrumVoice {
@@ -146,7 +199,7 @@ private:
     };
 
     // ── Voice pools ─────────────────────────────────────────────────────
-    static constexpr u32 kMelodyVoices = 4;
+    static constexpr u32 kMelodyVoices = 6;
     static constexpr u32 kChordVoices  = 12;
     static constexpr u32 kBassVoices   = 2;
     static constexpr u32 kDrumVoices   = 6;
