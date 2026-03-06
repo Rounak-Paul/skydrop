@@ -224,13 +224,29 @@ i32 ImageComposer::DeriveRootNote(const ImageAnalysis& a) {
 }
 
 const std::vector<i32>* ImageComposer::DeriveScale(const ImageAnalysis& a) {
-    bool warm = a.color.warmth > 0.0f;
-    if (a.color.complexity < 0.3f)
+    bool warm   = a.color.warmth > 0.0f;
+    bool bright = a.color.brightness > 0.6f;
+    f32  comp   = a.color.complexity;
+    f32  sat    = a.color.saturation;
+
+    if (comp < 0.25f) {
+        // Simple images: pentatonic scales (hard to hit wrong notes).
         return warm ? &scales::Pentatonic : &scales::MinorPenta;
-    else if (a.color.complexity > 0.65f)
+    } else if (comp > 0.7f && sat > 0.5f) {
+        // Complex, saturated images: modal scales.
         return warm ? &scales::Mixolydian : &scales::Dorian;
-    else
+    } else if (!warm && !bright) {
+        // Dark, cool images: full minor.
+        return &scales::Minor;
+    } else if (warm && bright) {
+        // Warm, bright images: major.
+        return &scales::Major;
+    } else if (!warm && comp > 0.4f) {
+        // Cool complex: blues.
+        return &scales::Blues;
+    } else {
         return warm ? &scales::Major : &scales::Minor;
+    }
 }
 
 
@@ -428,11 +444,12 @@ Motif ImageComposer::ExtractMotif(
         }
         f32 centroid = (totalWeight > 1e-6f) ? (weightedSum / totalWeight) : 0.5f;
 
-        // Convert to interval: centroid 0-1 → -12..+12 semitones.
-        i32 rawInterval = static_cast<i32>((centroid - 0.5f) * 24.0f);
-        // Stepwise motion preference: limit jump from previous note.
-        if (rawInterval > prevInterval + 5) rawInterval = prevInterval + 5;
-        if (rawInterval < prevInterval - 5) rawInterval = prevInterval - 5;
+        // Convert to interval: centroid 0-1 → -7..+7 semitones (one 5th up/down).
+        // Narrower range than before to keep melody in a comfortable register.
+        i32 rawInterval = static_cast<i32>((centroid - 0.5f) * 14.0f);
+        // Stepwise motion preference: limit jump from previous note (max 3 semitones step).
+        if (rawInterval > prevInterval + 4) rawInterval = prevInterval + 4;
+        if (rawInterval < prevInterval - 4) rawInterval = prevInterval - 4;
         // Snap to scale.
         i32 snapped = SnapMidiToScale(root + rawInterval, root, scale) - root;
         m.intervals.push_back(snapped);
@@ -474,8 +491,12 @@ std::vector<f32> ImageComposer::BuildHarmonicProfile(const ImageAnalysis& a) {
     std::vector<f32> profile(kNumHarmonics, 0.0f);
 
     if (a.frequencyBands.empty()) {
+        // Natural 1/n harmonic rolloff (warm, not buzzy).
         for (u32 h = 0; h < kNumHarmonics; ++h)
-            profile[h] = 1.0f / static_cast<f32>(h + 1);
+            profile[h] = 1.0f / static_cast<f32>((h + 1) * (h + 1));  // 1/n^2 rolloff
+        profile[0] = 1.0f;   // fundamental always dominant
+        profile[1] = 0.5f;   // 2nd harmonic present
+        profile[2] = 0.25f;  // 3rd at -12dB
         return profile;
     }
 
@@ -495,7 +516,18 @@ std::vector<f32> ImageComposer::BuildHarmonicProfile(const ImageAnalysis& a) {
     if (maxVal > 1e-6f) {
         for (auto& v : profile) v /= maxVal;
     }
-    profile[0] = std::max(profile[0], 0.3f);
+    profile[0] = std::max(profile[0], 0.6f);
+
+    // Apply 1/n^1.5 spectral rolloff envelope to tame high harmonics.
+    for (u32 h = 0; h < kNumHarmonics; ++h) {
+        f32 rolloff = 1.0f / std::pow(static_cast<f32>(h + 1), 1.5f);
+        profile[h] *= rolloff;
+    }
+
+    // Re-normalize.
+    maxVal = *std::max_element(profile.begin(), profile.end());
+    if (maxVal > 1e-6f)
+        for (auto& v : profile) v /= maxVal;
 
     return profile;
 }
@@ -587,8 +619,6 @@ std::vector<ChordEvent> ImageComposer::BuildChords(
     default:                   beatsPerChord = 4.0f; break;
     }
 
-    static const i32 hueToPCOffset[] = {0,7,2,9,4,11,6,1,8,3,10,5};
-
     // Cache chord progressions per region index for repetition.
     std::unordered_map<u32, std::vector<ChordEvent>> regionChords;
 
@@ -620,75 +650,89 @@ std::vector<ChordEvent> ImageComposer::BuildChords(
         u32 imgW = std::max(1u, static_cast<u32>(secLen / totalBeats * img.Width()));
         if (imgX + imgW > img.Width()) imgW = img.Width() - imgX;
 
+        // ── Musical chord progressions (scale-degree based) ──────────
+        // These stay within the scale so every chord is consonant with
+        // the melody. The image hue/brightness selects which progression.
+        // Scale degrees (0-indexed): I=0, II=1, III=2, IV=3, V=4, VI=5, VII=6
+        // Each progression is listed as scale-degree indices.
+        static const i32 kProgressions[6][4] = {
+            {0, 5, 3, 4},  // I-VI-IV-V  (most common pop)
+            {0, 3, 4, 0},  // I-IV-V-I   (classic)
+            {5, 3, 0, 4},  // VI-IV-I-V  (melancholic)
+            {0, 4, 5, 3},  // I-V-VI-IV  (axis progression)
+            {0, 2, 3, 4},  // I-III-IV-V (ascending)
+            {5, 6, 0, 4},  // VI-VII-I-V (dramatic)
+        };
+
+        // Choose progression from image hue/saturation of this section's region.
+        auto avgColorSec = img.AverageColor(imgX, 0, imgW, img.Height());
+        auto hsbSec = ToHSB(avgColorSec[0], avgColorSec[1], avgColorSec[2]);
+        f32 secHue = hsbSec[0], secSat = hsbSec[1], secBri = hsbSec[2];
+
+        // Section type biases the progression choice.
+        u32 progIdx;
+        switch (sec.type) {
+        case SectionType::Chorus:    progIdx = 0; break;  // bright, uplifting
+        case SectionType::Verse:     progIdx = 2; break;  // introspective
+        case SectionType::PreChorus: progIdx = 3; break;  // building tension
+        case SectionType::Bridge:    progIdx = 5; break;  // dramatic contrast
+        case SectionType::Drop:      progIdx = 1; break;  // classic strong
+        default:
+            progIdx = static_cast<u32>((secHue / 60.0f)) % 6; break;
+        }
+
         for (u32 i = 0; i < numChordsInSec; ++i) {
-            u32 chordX = imgX + i * imgW / numChordsInSec;
-            u32 chordW = std::max(1u, imgW / numChordsInSec);
-            if (chordX + chordW > img.Width()) chordW = img.Width() - chordX;
+            // Get the scale degree from the progression (cycle if more chords than 4).
+            i32 scaleDeg = kProgressions[progIdx][i % 4];
+            // Map scale degree to actual MIDI note: root + scale[scaleDeg].
+            i32 chordRoot = root + scale[std::min(scaleDeg, (i32)scale.size()-1)];
+            // Place chord root in octave below melody center (C3-C4 range).
+            while (chordRoot > 59) chordRoot -= 12;
+            while (chordRoot < 40) chordRoot += 12;
 
-            auto avgColor = img.AverageColor(chordX, 0, chordW, img.Height());
-            auto hsb = ToHSB(avgColor[0], avgColor[1], avgColor[2]);
-            f32 hue = hsb[0], sat = hsb[1], bri = hsb[2];
+            // Chord quality: use the intervals fitting the scale at this degree.
+            // Build triad from scale: root, 3rd, 5th (all snapped to scale).
+            i32 third = SnapMidiToScale(chordRoot + 4, root, scale);
+            i32 fifth = SnapMidiToScale(chordRoot + 7, root, scale);
+            // Keep third/fifth above root, below root+12.
+            while (third  <= chordRoot) third  += 12;
+            while (fifth  <= chordRoot) fifth  += 12;
+            while (third  >  chordRoot + 12) third  -= 12;
+            while (fifth  >  chordRoot + 12) fifth  -= 12;
 
-            // Chord root from hue.
-            i32 hueSegment = static_cast<i32>(hue / 30.0f) % 12;
-            i32 pcOffset = hueToPCOffset[hueSegment];
-            i32 chordRoot = SnapMidiToScale(root + pcOffset, root, scale);
-            while (chordRoot < root - 5) chordRoot += 12;
-            while (chordRoot > root + 16) chordRoot -= 12;
-
-            // Quality from saturation.
             std::vector<i32> intervals;
-            if (sat > 0.55f)
-                intervals = {0, 4, 7};
-            else if (sat > 0.25f)
-                intervals = {0, 3, 7};
-            else
-                intervals = (hueSegment % 2 == 0)
-                    ? std::vector<i32>{0, 5, 7} : std::vector<i32>{0, 2, 7};
+            intervals.push_back(0);
+            if (third != chordRoot) intervals.push_back(third - chordRoot);
+            if (fifth != chordRoot && fifth != third) intervals.push_back(fifth - chordRoot);
 
-            // Extensions from color variance.
-            f32 variance = 0;
-            u32 numSamples = std::min(8u, chordW);
-            if (numSamples > 1) {
-                auto prevSamp = img.AverageColor(chordX, 0, 1, img.Height());
-                for (u32 s = 1; s < numSamples; ++s) {
-                    u32 sx = chordX + s * chordW / numSamples;
-                    if (sx >= img.Width()) sx = img.Width() - 1;
-                    auto samp = img.AverageColor(sx, 0, 1, img.Height());
-                    variance += ColorDist(prevSamp, samp);
-                    prevSamp = samp;
-                }
-                variance /= static_cast<f32>(numSamples - 1);
+            // Optional 7th for richer harmony (higher saturation → 7th chord).
+            if (secSat > 0.4f && numChordsInSec >= 2) {
+                i32 seventh = SnapMidiToScale(chordRoot + 10, root, scale);
+                while (seventh <= chordRoot + (fifth - chordRoot)) seventh += 12;
+                if (seventh <= chordRoot + 14)
+                    intervals.push_back(seventh - chordRoot);
             }
 
-            if (variance > 0.08f) {
-                bool isMinor = (intervals.size() >= 2 && intervals[1] == 3);
-                intervals.push_back(isMinor ? 10 : 11);
-            }
-            if (variance > 0.15f)
-                intervals.push_back(14);
-
-            // Register from brightness + section type.
-            i32 voiceShift = static_cast<i32>((bri - 0.5f) * 2.0f) * 12;
-            if (sec.type == SectionType::Breakdown || sec.type == SectionType::Intro)
-                voiceShift -= 12;
-            if (sec.type == SectionType::Chorus)
-                voiceShift += 0; // higher register for chorus
+            // Voicing: cinematic/ethereal goes one octave lower for warmth.
+            i32 voiceShift = 0;
             if (style == CompStyle::Cinematic || style == CompStyle::Ethereal)
+                voiceShift = -12;
+            if (sec.type == SectionType::Intro || sec.type == SectionType::Breakdown)
                 voiceShift -= 12;
 
             ChordEvent ev;
             ev.startBeat = sec.startBeat + static_cast<f32>(i) * beatsPerChord;
             ev.duration  = beatsPerChord;
-            ev.velocity  = 0.30f + bri * 0.4f + sec.energy * 0.2f;
+            ev.velocity  = 0.30f + secBri * 0.25f + sec.energy * 0.2f;
 
             for (i32 iv : intervals)
                 ev.midiNotes.push_back(chordRoot + voiceShift + iv);
 
-            // Octave doubling in Chorus and Cinematic/Ethereal.
-            if (sec.type == SectionType::Chorus ||
-                style == CompStyle::Ethereal || style == CompStyle::Cinematic)
-                ev.midiNotes.push_back(chordRoot + voiceShift + 12);
+            // In chorus, add a higher octave root for fullness (capped at MIDI 72).
+            if (sec.type == SectionType::Chorus) {
+                i32 top = chordRoot + voiceShift + 12;
+                if (top <= 72) ev.midiNotes.push_back(top);
+            }
 
             secChords.push_back(ev);
             chords.push_back(ev);
@@ -732,16 +776,23 @@ std::vector<NoteEvent> ImageComposer::BuildMelody(
     }
 
     // Style parameters.
+    // Melody octave offset from root: keep melody in a comfortable mid register.
+    // Root is typically around MIDI 48-59 (C3-B3), so +12 = C4-B4, +24 = C5-B5.
+    // Cinematic: one octave up (not two) to avoid piercing highs.
     i32 melodyOctave;
     f32 restProbBase;
+    // Max interval excursion in semitones from the center pitch (constrains range).
+    i32 maxExcursion;
     switch (style) {
-    case CompStyle::Ethereal:  melodyOctave = 12; restProbBase = 0.30f; break;
-    case CompStyle::Harmonic:  melodyOctave = 12; restProbBase = 0.15f; break;
-    case CompStyle::Rhythmic:  melodyOctave = 12; restProbBase = 0.18f; break;
-    case CompStyle::Melodic:   melodyOctave = 12; restProbBase = 0.08f; break;
-    case CompStyle::Cinematic: melodyOctave = 24; restProbBase = 0.35f; break;
-    default:                   melodyOctave = 12; restProbBase = 0.15f; break;
+    case CompStyle::Ethereal:  melodyOctave = 12; restProbBase = 0.30f; maxExcursion = 7;  break;
+    case CompStyle::Harmonic:  melodyOctave = 12; restProbBase = 0.15f; maxExcursion = 10; break;
+    case CompStyle::Rhythmic:  melodyOctave = 12; restProbBase = 0.18f; maxExcursion = 8;  break;
+    case CompStyle::Melodic:   melodyOctave = 12; restProbBase = 0.08f; maxExcursion = 12; break;
+    case CompStyle::Cinematic: melodyOctave = 12; restProbBase = 0.35f; maxExcursion = 7;  break;
+    default:                   melodyOctave = 12; restProbBase = 0.15f; maxExcursion = 10; break;
     }
+    // Melody center pitch — used to keep melody from drifting too high.
+    i32 melodyCenterMidi = SnapMidiToScale(root + melodyOctave, root, scale);
 
     // ── Generate melody per section ─────────────────────────────────
     i32 prevMidi = root + melodyOctave;
@@ -817,24 +868,29 @@ std::vector<NoteEvent> ImageComposer::BuildMelody(
 
             // Play motif notes.
             for (u32 n = 0; n < motif.intervals.size() && beat < sec.endBeat; ++n) {
-                // Variation: transpose for repeats.
+                // Variation: transpose for repeats (small-interval transpositions).
                 i32 transposeShift = 0;
                 if (isVariation) {
-                    // Shift by a scale degree or two.
+                    // Shift by one scale step (2 semitones), not more.
                     transposeShift = (repeatCount % 3 == 1) ? 2 : (repeatCount % 3 == 2) ? -2 : 0;
-                    if (isAnswer) transposeShift += (n == motif.intervals.size() - 1) ? -transposeShift : 0;
+                    if (isAnswer) transposeShift = 0; // answer phrase stays in same range
                 }
 
                 i32 interval = motif.intervals[n] + transposeShift;
                 i32 targetMidi = root + melodyOctave + interval;
 
-                // Section type affects register.
+                // Section type affects register only slightly.
                 if (sec.type == SectionType::Chorus) targetMidi += 2;
                 if (sec.type == SectionType::Bridge) targetMidi -= 2;
 
-                // Constrain stepwise from previous.
-                if (targetMidi > prevMidi + 10) targetMidi = prevMidi + 10;
-                if (targetMidi < prevMidi - 10) targetMidi = prevMidi - 10;
+                // Hard clamp to melodyCenterMidi ± maxExcursion to prevent runaway highs.
+                targetMidi = std::clamp(targetMidi,
+                    melodyCenterMidi - maxExcursion,
+                    melodyCenterMidi + maxExcursion);
+
+                // Constrain stepwise motion from previous note (max 7 semitones per step).
+                if (targetMidi > prevMidi + 7) targetMidi = prevMidi + 7;
+                if (targetMidi < prevMidi - 7) targetMidi = prevMidi - 7;
 
                 // On strong beats, pull toward chord tone.
                 bool strongBeat = (std::fmod(beat, 4.0f) < 0.05f);
@@ -929,20 +985,20 @@ std::vector<NoteEvent> ImageComposer::BuildMelody(
                 if (RandF(rng) < chordProb) {
                     if (localSat > 0.55f &&
                         (sec.type == SectionType::Chorus || sec.type == SectionType::Drop)) {
-                        // Rich: third + fifth.
+                        // Rich: third below (more natural than third above) + fifth.
                         ev.harmonize.push_back(
-                            SnapMidiToScale(targetMidi + 4, root, scale));
+                            SnapMidiToScale(targetMidi - 3, root, scale));  // minor third below
                         if (dur >= 1.0f)
                             ev.harmonize.push_back(
                                 SnapMidiToScale(targetMidi + 7, root, scale));
                     } else if (localSat > 0.35f) {
-                        // Medium: fifth or octave.
-                        ev.harmonize.push_back(dur >= 1.5f
-                            ? SnapMidiToScale(targetMidi + 7, root, scale)
-                            : targetMidi + 12);
+                        // Medium: fifth (stays in same octave — no high octave doubling).
+                        ev.harmonize.push_back(
+                            SnapMidiToScale(targetMidi + 7, root, scale));
                     } else {
-                        // Light: octave doubling.
-                        ev.harmonize.push_back(targetMidi + 12);
+                        // Light: third above (in-scale, no octave jump).
+                        ev.harmonize.push_back(
+                            SnapMidiToScale(targetMidi + 4, root, scale));
                     }
                     // More legato for chord passages.
                     ev.duration = dur * 0.94f;
@@ -1073,22 +1129,52 @@ std::vector<DrumHit> ImageComposer::BuildDrums(
 
     auto sections = BuildStructure(img, a, totalBeats, style);
 
-    // Resolution per step.
-    f32 resolution;
-    switch (style) {
-    case CompStyle::Ethereal:  resolution = 1.0f;  break;
-    case CompStyle::Cinematic: resolution = 1.0f;  break;
-    case CompStyle::Harmonic:  resolution = 0.5f;  break;
-    case CompStyle::Melodic:   resolution = 0.5f;  break;
-    case CompStyle::Rhythmic:  resolution = 0.25f; break;
-    default:                   resolution = 0.5f;  break;
+    // ── Groove template selection ─────────────────────────────────────
+    // Use image edge density to select one of several kick patterns.
+    // Kick pattern: 1 = kick on this 16th step (16 steps per 4-beat bar).
+    // Standard groove: kick on 1 and 3 (steps 0, 8), snare on 2 and 4 (steps 4, 12).
+    // Each pattern is 16 steps (1 bar), tiled across the composition.
+    static const u8 kKickPatterns[4][16] = {
+        {1,0,0,0, 0,0,0,0, 1,0,0,0, 0,0,0,0},  // Four-on-the-floor variants
+        {1,0,0,0, 0,0,1,0, 1,0,0,0, 0,0,0,0},  // Kick: 1, 2-and, 3
+        {1,0,0,0, 0,0,0,0, 1,0,0,1, 0,0,0,0},  // Kick: 1, 3, 3-and
+        {1,0,1,0, 0,0,0,0, 1,0,0,0, 0,1,0,0},  // Syncopated
+    };
+    static const u8 kSnarePatterns[3][16] = {
+        {0,0,0,0, 1,0,0,0, 0,0,0,0, 1,0,0,0},  // Standard backbeat (beats 2 & 4)
+        {0,0,0,0, 1,0,0,1, 0,0,0,0, 1,0,0,0},  // Backbeat + 2-and ghost
+        {0,0,0,0, 1,0,0,0, 0,0,1,0, 1,0,0,1},  // Syncopated snare fills
+    };
+    static const u8 kHatPatterns[4][16] = {
+        {1,0,1,0, 1,0,1,0, 1,0,1,0, 1,0,1,0},  // Straight 8ths
+        {1,1,1,1, 1,1,1,1, 1,1,1,1, 1,1,1,1},  // 16th-note hats
+        {1,0,0,1, 0,1,0,0, 1,0,0,1, 0,1,0,0},  // Off-beat hats (reggae/funk)
+        {1,0,1,0, 0,0,1,0, 1,0,1,0, 0,0,1,0},  // Swing groove
+    };
+
+    // Choose groove based on image texture and style.
+    u32 kickPatIdx  = static_cast<u32>(a.edges.density * 3.99f);
+    u32 snarePatIdx = static_cast<u32>(a.texture.roughness * 2.99f);
+    u32 hatPatIdx   = static_cast<u32>(a.texture.regularity * 3.99f);
+    kickPatIdx  = std::min(kickPatIdx,  3u);
+    snarePatIdx = std::min(snarePatIdx, 2u);
+    hatPatIdx   = std::min(hatPatIdx,   3u);
+
+    // For ethereal/cinematic: simpler patterns (kick pattern 0, sparse hats).
+    if (style == CompStyle::Ethereal || style == CompStyle::Cinematic) {
+        kickPatIdx  = 0;
+        snarePatIdx = 0;
+        hatPatIdx   = 0;
     }
 
-    u32 numSteps = static_cast<u32>(totalBeats / resolution);
+    // 16th-note grid step size is always 0.25 beats.
+    const f32 stepSize = 0.25f;
+    u32 numSteps = static_cast<u32>(totalBeats / stepSize);
 
     for (u32 s = 0; s < numSteps; ++s) {
-        f32 beat = s * resolution;
+        f32 beat = s * stepSize;
         f32 t = beat / totalBeats;
+        u32 step16 = s % 16;   // position within 1-bar pattern (0-15)
 
         const Section* sec = SectionAt(sections, beat);
         if (!sec) continue;
@@ -1096,82 +1182,69 @@ std::vector<DrumHit> ImageComposer::BuildDrums(
         f32 secLen = sec->endBeat - sec->startBeat;
         f32 secPos = (beat - sec->startBeat) / std::max(1.0f, secLen);
 
-        // ── Section-based thresholds ────────────────────────────────
-        f32 kickTh, snareTh, hatTh, densityMul;
+        // Drop: silence at start.
+        if (sec->isDrop && secPos < 0.1f) continue;
 
+        // ── Section activity level ───────────────────────────────────
+        f32 densityMul;
         switch (sec->type) {
-        case SectionType::Intro:
-            kickTh = 0.85f; snareTh = 0.95f; hatTh = 0.60f; densityMul = 0.3f; break;
-        case SectionType::Verse:
-            kickTh = 0.45f; snareTh = 0.55f; hatTh = 0.25f; densityMul = 0.6f; break;
-        case SectionType::PreChorus:
-            kickTh = 0.40f; snareTh = 0.45f; hatTh = 0.15f; densityMul = 0.75f; break;
-        case SectionType::Chorus:
-            kickTh = 0.25f; snareTh = 0.30f; hatTh = 0.08f; densityMul = 1.0f; break;
-        case SectionType::Bridge:
-            kickTh = 0.55f; snareTh = 0.65f; hatTh = 0.30f; densityMul = 0.5f; break;
-        case SectionType::Drop:
-            kickTh = 0.20f; snareTh = 0.25f; hatTh = 0.05f; densityMul = 1.1f; break;
-        case SectionType::Breakdown:
-            kickTh = 0.90f; snareTh = 0.95f; hatTh = 0.70f; densityMul = 0.15f; break;
-        case SectionType::Outro:
-            kickTh = 0.50f; snareTh = 0.60f; hatTh = 0.30f; densityMul = 0.5f; break;
-        default:
-            kickTh = 0.40f; snareTh = 0.50f; hatTh = 0.20f; densityMul = 0.7f; break;
+        case SectionType::Intro:     densityMul = 0.0f;  break;  // no drums in intro
+        case SectionType::Verse:     densityMul = 0.7f;  break;
+        case SectionType::PreChorus: densityMul = 0.85f; break;
+        case SectionType::Chorus:    densityMul = 1.0f;  break;
+        case SectionType::Bridge:    densityMul = 0.6f;  break;
+        case SectionType::Drop:      densityMul = 1.1f;  break;
+        case SectionType::Breakdown: densityMul = 0.0f;  break;  // no drums in breakdown
+        case SectionType::Outro:     densityMul = 0.5f;  break;
+        default:                     densityMul = 0.7f;  break;
         }
 
-        // Style scaling.
-        if (style == CompStyle::Ethereal || style == CompStyle::Cinematic) {
-            kickTh += 0.15f; snareTh += 0.15f; hatTh += 0.15f;
-        }
-        if (style == CompStyle::Rhythmic) {
-            kickTh -= 0.10f; snareTh -= 0.10f; hatTh -= 0.05f;
-        }
+        if (style == CompStyle::Ethereal || style == CompStyle::Cinematic)
+            densityMul *= 0.6f;
 
-        // Build: increasing density through section.
-        if (sec->isBuild) {
-            f32 buildFactor = secPos * 0.3f;
-            kickTh -= buildFactor;
-            snareTh -= buildFactor;
-            hatTh -= buildFactor;
-        }
+        // Build: gradually add density.
+        if (sec->isBuild) densityMul *= (0.5f + 0.5f * secPos);
 
-        // Drop: silence at start, then full.
-        if (sec->isDrop && secPos < 0.1f) {
-            continue; // no drums during drop silence
-        }
+        if (densityMul < 0.05f) continue;
 
-        // Edge data drives the pattern.
         f32 edgeV = SampleProfile(a.edges.verticalProfile, t);
         f32 edgeH = SampleProfile(a.edges.horizontalProfile, t);
 
-        // Musical position.
-        f32 beatPhase4 = std::fmod(beat, 4.0f);
-        bool isDownbeat = (beatPhase4 < 0.05f);
-        bool isBackbeat = (std::abs(beatPhase4 - 2.0f) < 0.05f);
+        // ── Groove pattern lookup ────────────────────────────────────
+        bool kickOn  = (kKickPatterns[kickPatIdx][step16] != 0);
+        bool snareOn = (kSnarePatterns[snarePatIdx][step16] != 0);
+        bool hatOn   = (kHatPatterns[hatPatIdx][step16] != 0);
 
-        f32 kickScore  = edgeV * densityMul + (isDownbeat ? 0.2f : 0.0f);
-        f32 snareScore = edgeH * densityMul + (isBackbeat ? 0.15f : 0.0f);
-        f32 hatScore   = (edgeV + edgeH) * 0.5f * densityMul;
-
-        // Kick.
-        if (kickScore > kickTh) {
-            f32 vel = std::clamp(kickScore * 1.1f, 0.3f, 1.0f);
-            drums.push_back({beat, DrumType::Kick, vel});
+        // Image modulation: low edge density can remove occasional hits.
+        // Kick: strong musical anchor — keep it unless section is very sparse.
+        if (kickOn && densityMul > 0.1f) {
+            f32 vel = 0.7f + edgeV * 0.3f;
+            // Stronger on beat 1 (step 0 of bar).
+            if (step16 == 0) vel = std::min(vel + 0.1f, 1.0f);
+            // Build: crescendo.
+            if (sec->isBuild) vel *= (0.6f + 0.4f * secPos);
+            drums.push_back({beat, DrumType::Kick, std::clamp(vel * densityMul, 0.3f, 1.0f)});
         }
 
-        // Snare.
-        if (snareScore > snareTh && (kickScore <= kickTh || snareScore > 0.7f)) {
-            f32 vel = std::clamp(snareScore, 0.25f, 0.85f);
-            drums.push_back({beat, DrumType::Snare, vel});
+        // Snare: musical backbeat — keep it consistent.
+        if (snareOn && densityMul > 0.3f) {
+            f32 vel = 0.65f + edgeH * 0.25f;
+            if (sec->isBuild) vel *= (0.5f + 0.5f * secPos);
+            drums.push_back({beat, DrumType::Snare, std::clamp(vel, 0.3f, 0.9f)});
         }
 
-        // Hi-hat.
-        if (hatScore > hatTh) {
-            f32 vel = std::clamp(hatScore * 0.6f, 0.1f, 0.5f);
-            DrumType type = (edgeV > 0.7f && edgeH > 0.5f)
-                          ? DrumType::OpenHat : DrumType::HiHat;
-            drums.push_back({beat, type, vel});
+        // Hi-hat: image edge drives velocity variation, but pattern stays musical.
+        if (hatOn) {
+            f32 vel = 0.25f + (edgeV + edgeH) * 0.15f;
+            // Open hat on off-beats in chorus/drop.
+            bool isOffbeat = (step16 % 4 == 2);
+            bool openHat = isOffbeat && (sec->type == SectionType::Chorus ||
+                                         sec->type == SectionType::Drop) &&
+                           edgeV > 0.4f;
+            DrumType ht = openHat ? DrumType::OpenHat : DrumType::HiHat;
+            // Fewer hats in sparse sections.
+            if (densityMul > 0.4f || (step16 % 4 == 0))
+                drums.push_back({beat, ht, std::clamp(vel, 0.1f, 0.5f)});
         }
     }
 
@@ -1199,18 +1272,19 @@ std::vector<DrumHit> ImageComposer::BuildDrums(
         }
     }
 
-    // Ensure minimal pulse in chorus/verse sections.
+    // Ensure minimal pulse in chorus/verse sections (beat 1 of each bar if missing).
+    // With the groove patterns this rarely fires, but ensures no silent bars.
     for (auto& sec : sections) {
-        if (sec.type == SectionType::Chorus || sec.type == SectionType::Verse) {
-            for (f32 b = sec.startBeat; b < sec.endBeat; b += 4.0f) {
-                bool hasKick = false;
-                for (auto& d : drums) {
-                    if (std::abs(d.beat - b) < 0.1f && d.type == DrumType::Kick) {
-                        hasKick = true; break;
-                    }
+        if (sec.type == SectionType::Breakdown || sec.type == SectionType::Intro) continue;
+        for (f32 b = sec.startBeat; b < sec.endBeat; b += 4.0f) {
+            bool hasKick = false;
+            for (auto& d : drums) {
+                if (std::abs(d.beat - b) < 0.1f && d.type == DrumType::Kick) {
+                    hasKick = true; break;
                 }
-                if (!hasKick) drums.push_back({b, DrumType::Kick, 0.3f});
             }
+            if (!hasKick && sec.type != SectionType::Breakdown)
+                drums.push_back({b, DrumType::Kick, 0.5f});
         }
     }
 
@@ -1479,19 +1553,25 @@ f32 MusicRenderer::RenderMelodyVoice(Voice& v) {
     if (hp.empty()) {
         sample = std::sin(kTwoPI * p);
     } else {
-        for (u32 h = 0; h < static_cast<u32>(hp.size()); ++h) {
+        // Use only first 4 harmonics for melody to keep it warm and clear.
+        u32 numH = std::min(static_cast<u32>(hp.size()), 4u);
+        for (u32 h = 0; h < numH; ++h) {
             sample += hp[h] * std::sin(kTwoPI * static_cast<f32>(h + 1) * p);
         }
     }
 
     if (comp_.noiseBlend > 0.001f) {
-        sample = sample * (1.0f - comp_.noiseBlend) + Noise() * comp_.noiseBlend;
+        sample = sample * (1.0f - comp_.noiseBlend) + Noise() * comp_.noiseBlend * 0.3f;
     }
 
     sample *= v.envLevel * v.amp * 0.4f;
 
-    f32 cutoff = 0.1f + brightness_ * 0.7f;
+    // Two-pole resonant-style lowpass: tighter cutoff to prevent harsh highs.
+    // Cutoff is proportional to frequency so higher notes get relatively more roll-off.
+    f32 cutoff = std::clamp(0.06f + brightness_ * 0.35f, 0.02f, 0.5f);
     v.filterState += cutoff * (sample - v.filterState);
+    f32 filtered2 = v.filterState;
+    filtered2 += cutoff * (v.filterState - filtered2);
     sample = v.filterState;
 
     v.phase += static_cast<f64>(v.freq) / sampleRate_;
@@ -1513,9 +1593,10 @@ void MusicRenderer::RenderChordVoice(Voice& v, f32& left, f32& right) {
         s1 = std::sin(kTwoPI * p1);
         s2 = std::sin(kTwoPI * p2);
     } else {
-        u32 numH = std::min(static_cast<u32>(hp.size()), 6u);
+        // Pads: only first 3 harmonics with strong rolloff — rich but warm.
+        u32 numH = std::min(static_cast<u32>(hp.size()), 3u);
         for (u32 h = 0; h < numH; ++h) {
-            f32 weight = hp[h] * (1.0f / static_cast<f32>(h + 1));
+            f32 weight = hp[h] * (1.0f / static_cast<f32>((h + 1) * (h + 1)));
             s1 += weight * std::sin(kTwoPI * static_cast<f32>(h + 1) * p1);
             s2 += weight * std::sin(kTwoPI * static_cast<f32>(h + 1) * p2);
         }
@@ -1523,11 +1604,12 @@ void MusicRenderer::RenderChordVoice(Voice& v, f32& left, f32& right) {
 
     f32 sample = (s1 + s2) * 0.2f * v.envLevel * v.amp;
 
-    f32 cutoff = 0.05f + brightness_ * 0.4f;
+    // Tight lowpass for pads — remove high-frequency content aggressively.
+    f32 cutoff = std::clamp(0.04f + brightness_ * 0.25f, 0.02f, 0.35f);
     if (comp_.filterSweep > 0.001f) {
-        f32 lfo = std::sin(kTwoPI * static_cast<f32>(v.phase * 0.1));
-        cutoff += comp_.filterSweep * lfo * 0.1f;
-        cutoff = std::clamp(cutoff, 0.01f, 0.95f);
+        f32 lfo = 0.5f + 0.5f * std::sin(kTwoPI * static_cast<f32>(v.phase * 0.05));
+        cutoff += comp_.filterSweep * lfo * 0.05f;
+        cutoff = std::clamp(cutoff, 0.02f, 0.45f);
     }
     v.filterState += cutoff * (sample - v.filterState);
     sample = v.filterState;
@@ -1584,34 +1666,38 @@ f32 MusicRenderer::RenderDrumVoice(DrumVoice& v) {
 
     switch (v.type) {
     case DrumType::Kick: {
-        f32 freq = 50.0f + 100.0f * v.env * v.env;
+        // Pitch sweep: 150Hz → 40Hz as envelope decays (punchy sub kick).
+        f32 freq = 40.0f + 110.0f * v.env * v.env;
         sample = std::sin(kTwoPI * static_cast<f32>(v.phase)) * v.env;
         v.phase += static_cast<f64>(freq) / sampleRate_;
-        decayRate = 1.0f - 5.0f / sampleRate_;
+        decayRate = 1.0f - 4.0f / sampleRate_;
         break;
     }
     case DrumType::Snare: {
-        f32 body = std::sin(kTwoPI * static_cast<f32>(v.phase)) * v.env * 0.5f;
-        v.phase += 180.0 / sampleRate_;
-        f32 noise = Noise() * v.env * 0.5f;
-        v.filterState += 0.3f * (noise - v.filterState);
-        noise = noise - v.filterState;
-        sample = body + noise;
-        decayRate = 1.0f - 7.0f / sampleRate_;
+        // Body: 200Hz sine + noise burst filtered for snap.
+        f32 body = std::sin(kTwoPI * static_cast<f32>(v.phase)) * v.env * 0.45f;
+        v.phase += 200.0 / sampleRate_;
+        f32 noise = Noise() * v.env;
+        // High-pass the noise to get snare rattle (subtract low-pass).
+        v.filterState += 0.4f * (noise - v.filterState);
+        f32 rattle = (noise - v.filterState) * 0.55f;
+        sample = body + rattle;
+        decayRate = 1.0f - 9.0f / sampleRate_;
         break;
     }
     case DrumType::HiHat: {
         f32 noise = Noise();
-        v.filterState += 0.15f * (noise - v.filterState);
-        sample = (noise - v.filterState) * v.env * 0.4f;
-        decayRate = 1.0f - 30.0f / sampleRate_;
+        // High-pass: subtract a strong LP to get a bright, metallic hi-hat.
+        v.filterState += 0.2f * (noise - v.filterState);
+        sample = (noise - v.filterState) * v.env * 0.35f;
+        decayRate = 1.0f - 35.0f / sampleRate_;
         break;
     }
     case DrumType::OpenHat: {
         f32 noise = Noise();
         v.filterState += 0.15f * (noise - v.filterState);
-        sample = (noise - v.filterState) * v.env * 0.35f;
-        decayRate = 1.0f - 5.0f / sampleRate_;
+        sample = (noise - v.filterState) * v.env * 0.3f;
+        decayRate = 1.0f - 6.0f / sampleRate_;
         break;
     }
     }
@@ -1705,12 +1791,13 @@ void MusicRenderer::Process(SampleBuffer* output, u32 bufferSize) {
         left  *= (0.3f + eg * 0.7f) * dynGain;
         right *= (0.3f + eg * 0.7f) * dynGain;
 
-        f32 masterCutoff = 0.3f + brightness_ * 0.7f;
+        // Master lowpass — keep it warm, cap at 0.6 to always roll off some highs.
+        f32 masterCutoff = std::clamp(0.25f + brightness_ * 0.35f, 0.1f, 0.6f);
         masterFilterL_ += masterCutoff * (left  - masterFilterL_);
         masterFilterR_ += masterCutoff * (right - masterFilterR_);
 
-        left  = std::tanh(masterFilterL_ * 1.5f);
-        right = std::tanh(masterFilterR_ * 1.5f);
+        left  = std::tanh(masterFilterL_ * 1.2f);
+        right = std::tanh(masterFilterR_ * 1.2f);
 
         output->SetSample(0, f, left);
         if (output->Channels() > 1) output->SetSample(1, f, right);
