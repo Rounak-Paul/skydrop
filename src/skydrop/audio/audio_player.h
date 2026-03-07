@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 class AudioPlayer {
 public:
@@ -28,12 +29,10 @@ public:
     static bool  IsPlaying();
     static bool  IsPaused();
 
-    // Album art decoded to RGBA8 pixels. Valid only after a successful Load()
-    // that contained embedded artwork. Callers must not free this pointer.
-    static const uint8_t* GetAlbumArtPixels();
-    static int            GetAlbumArtWidth();
-    static int            GetAlbumArtHeight();
-    static bool           HasAlbumArt();
+    // Album art decoded to RGBA8 pixels.  Copies the data out — safe to call
+    // from any thread after a successful Load() that contained artwork.
+    // Returns false (and leaves pixels empty) when no art is available.
+    static bool CopyAlbumArt(std::vector<uint8_t>& pixels, int& width, int& height);
 
     // ID3 / file-format metadata (returned by value — safe from any thread)
     static std::string GetTitle();

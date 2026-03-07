@@ -9,6 +9,7 @@
 #include <imgui.h>
 
 #include <cstdio>
+#include <vector>
 
 // ---- Statics ------------------------------------------------------------
 
@@ -41,15 +42,16 @@ void PlayerPanel::RebuildArtTexture() {
     tvk::Renderer* renderer = tvk::App::Get()->GetRenderer();
     if (!renderer) return;
 
-    if (AudioPlayer::HasAlbumArt()) {
+    std::vector<uint8_t> artPixels;
+    int artW = 0, artH = 0;
+
+    if (AudioPlayer::CopyAlbumArt(artPixels, artW, artH)) {
         _artTexture = tvk::Texture::Create(
             renderer,
-            AudioPlayer::GetAlbumArtPixels(),
-            static_cast<tvk::u32>(AudioPlayer::GetAlbumArtWidth()),
-            static_cast<tvk::u32>(AudioPlayer::GetAlbumArtHeight()),
-            tvk::TextureSpec{
-                .generateMipmaps = false
-            });
+            artPixels.data(),
+            static_cast<tvk::u32>(artW),
+            static_cast<tvk::u32>(artH),
+            tvk::TextureSpec{ .generateMipmaps = false });
     } else {
         // 1×1 grey placeholder
         static const uint8_t grey[4] = { 80, 80, 80, 255 };
