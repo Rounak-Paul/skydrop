@@ -1,6 +1,7 @@
 #pragma once
 
 #include <tinyvk/tinyvk.h>
+#include "event.h"
 
 class SkyDropApp : public tvk::App {
 public:
@@ -9,10 +10,14 @@ public:
 
 protected:
     void OnStart()   override;
+    void OnStop()    override;
     void OnUpdate()  override;
     void OnMenuBar() override;
     void OnUI()      override;
 
 private:
-    bool _showStats = true;
+    ListenerID _quitID   = 0;
+    ListenerID _volumeID = 0;
+    ListenerID _pauseID  = 0;
+    ListenerID _seekID   = 0;
 };

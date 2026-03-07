@@ -43,13 +43,20 @@ add_subdirectory(src/vendors/tinyvk EXCLUDE_FROM_ALL)
 add_executable(skydrop
     src/skydrop/main.cc
     src/skydrop/application.cc
+    src/skydrop/event.cc
+    src/skydrop/job_system.cc
+    src/skydrop/audio/audio_player.cc
+    src/skydrop/audio/music_queue.cc
+    src/skydrop/ui/menu_bar.cc
+    src/skydrop/ui/stats_panel.cc
+    src/skydrop/ui/player_panel.cc
+    src/skydrop/ui/queue_panel.cc
 )
 
 target_include_directories(skydrop PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/skydrop
-    # openal-soft headers (also pulled in from OpenAL::OpenAL interface,
-    # but explicit here for clarity when AL_LIBTYPE_STATIC is needed)
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vendors/openal-soft/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/vendors/dr_libs
 )
 
 # Required when linking OpenAL as a static library
@@ -59,6 +66,7 @@ target_link_libraries(skydrop PRIVATE
     tinyvk
     OpenAL::OpenAL
 )
+
 
 set_target_properties(skydrop PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
