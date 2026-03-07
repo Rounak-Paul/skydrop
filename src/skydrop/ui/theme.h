@@ -68,6 +68,8 @@ static constexpr ImU32 U32TextDim      = IM_COL32( 96,  70,  19, 255);
 static constexpr ImU32 U32ArtBorder    = IM_COL32( 80,  53,   0, 200);
 static constexpr ImU32 U32ArtOverlay   = IM_COL32(  4,   3,   1, 160); // scanline tint
 static constexpr ImU32 U32ArtScanline  = IM_COL32(  0,   0,   0,  35); // per-line shade
+static constexpr ImU32 U32ArtAmberTint = IM_COL32(180, 100,   0,  55); // warm amber cast
+static constexpr ImU32 U32ArtVignette  = IM_COL32(  0,   0,   0, 180); // corner fade
 static constexpr ImU32 U32NowPlaying   = IM_COL32(255, 210,  80, 255); // active track
 
 // ---- Layout constants (in pixels, before DPI) -----------------------------
@@ -75,8 +77,9 @@ static constexpr ImU32 U32NowPlaying   = IM_COL32(255, 210,  80, 255); // active
 static constexpr float MenuBarH         = 20.0f;
 static constexpr float TabBarH          = 22.0f;
 static constexpr float TransportBtnW    = 36.0f;
-static constexpr float TransportBtnH    = 26.0f;
-static constexpr float ToggleBtnW       = 36.0f;    // icon-only toggle
+static constexpr float TransportBtnH    = 22.0f;
+static constexpr float ToggleBtnW       = 32.0f;    // icon-only toggle
+static constexpr float StatusBarH       = 14.0f;
 static constexpr float SeekBarH         = 10.0f;
 static constexpr float VolumeBarH       = 10.0f;
 static constexpr float ArtMaxFrac       = 0.72f;    // fraction of content width
@@ -116,6 +119,35 @@ inline void DrawSegBar(ImDrawList* dl, ImVec2 pos, ImVec2 size, float t, float s
 inline void DrawScanlines(ImDrawList* dl, ImVec2 tl, ImVec2 br) {
     for (float y = tl.y; y < br.y; y += 2.0f)
         dl->AddLine({ tl.x, y }, { br.x, y }, U32ArtScanline);
+}
+
+// Full retro CRT filter: scanlines + vertical grid lines + amber tint.
+inline void DrawRetroFilter(ImDrawList* dl, ImVec2 tl, ImVec2 br) {
+    // Horizontal scanlines every 2px
+    for (float y = tl.y; y < br.y; y += 2.0f)
+        dl->AddLine({ tl.x, y }, { br.x, y }, U32ArtScanline);
+
+    // Vertical grid lines every 3px — together with scanlines makes a dot-matrix grid
+    const ImU32 vline = IM_COL32(0, 0, 0, 22);
+    for (float x = tl.x; x < br.x; x += 3.0f)
+        dl->AddLine({ x, tl.y }, { x, br.y }, vline);
+
+    // Amber colour tint
+    dl->AddRectFilled(tl, br, U32ArtAmberTint);
+
+    // Vignette — four gradient edges darkening toward the corners
+    const float vw = (br.x - tl.x) * 0.45f;
+    const float vh = (br.y - tl.y) * 0.45f;
+    const ImU32 vig = U32ArtVignette;
+    const ImU32 clr = IM_COL32(0, 0, 0, 0);
+    // Left
+    dl->AddRectFilledMultiColor({ tl.x,       tl.y }, { tl.x + vw,  br.y }, vig, clr, clr, vig);
+    // Right
+    dl->AddRectFilledMultiColor({ br.x - vw,  tl.y }, { br.x,       br.y }, clr, vig, vig, clr);
+    // Top
+    dl->AddRectFilledMultiColor({ tl.x, tl.y      }, { br.x, tl.y + vh  }, vig, vig, clr, clr);
+    // Bottom
+    dl->AddRectFilledMultiColor({ tl.x, br.y - vh }, { br.x, br.y       }, clr, clr, vig, vig);
 }
 
 // ---- Apply() — call once in OnStart before first frame --------------------

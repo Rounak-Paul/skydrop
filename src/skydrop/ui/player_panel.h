@@ -17,6 +17,7 @@ private:
     // Listener IDs
     static ListenerID _idTrackChanged;
     static ListenerID _idTick;
+    static ListenerID _idQueueChanged;
 
     // Cached playback state (updated from PlaybackTickEvent)
     static float  _pos;
@@ -29,6 +30,10 @@ private:
     static std::string _artist;
     static std::string _album;
     static float       _volume;
+
+    // Queue state
+    static int32_t _queueIndex;
+    static int32_t _queueSize;
 
     // Album art texture (Vulkan-backed, rendered via ImGui)
     static tvk::Ref<tvk::Texture> _artTexture;

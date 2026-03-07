@@ -18,6 +18,7 @@
 
 ListenerID PlayerPanel::_idTrackChanged = 0;
 ListenerID PlayerPanel::_idTick         = 0;
+ListenerID PlayerPanel::_idQueueChanged = 0;
 
 float       PlayerPanel::_pos     = 0.0f;
 float       PlayerPanel::_dur     = 0.0f;
@@ -27,6 +28,9 @@ std::string PlayerPanel::_title;
 std::string PlayerPanel::_artist;
 std::string PlayerPanel::_album;
 float       PlayerPanel::_volume  = 1.0f;
+
+int32_t PlayerPanel::_queueIndex = -1;
+int32_t PlayerPanel::_queueSize  = 0;
 
 tvk::Ref<tvk::Texture> PlayerPanel::_artTexture;
 bool                   PlayerPanel::_pendingRebuildArt = true;
@@ -119,11 +123,17 @@ void PlayerPanel::Init() {
         _playing = e.isPlaying;
         _paused  = e.isPaused;
     });
+
+    _idQueueChanged = Event::Register<QueueChangedEvent>([](const QueueChangedEvent& e) {
+        _queueIndex = e.currentIndex;
+        _queueSize  = static_cast<int32_t>(e.tracks.size());
+    });
 }
 
 void PlayerPanel::Shutdown() {
     Event::Unregister<TrackChangedEvent>(_idTrackChanged);
     Event::Unregister<PlaybackTickEvent>(_idTick);
+    Event::Unregister<QueueChangedEvent>(_idQueueChanged);
     _artTexture.reset();
 }
 
@@ -176,8 +186,8 @@ void PlayerPanel::OnUI() {
             Theme::U32AccentDim, ICON_FA_MUSIC);
     }
 
-    // Scanlines
-    Theme::DrawScanlines(dl, artTL, artBR);
+    // Retro CRT filter — scanlines + amber tint + vignette
+    Theme::DrawRetroFilter(dl, artTL, artBR);
 
     // Dark gradient rising from the bottom — makes text legible
     const float gradH  = artH * 0.60f;
@@ -295,6 +305,21 @@ void PlayerPanel::OnUI() {
         volPos.y += (lineH - Theme::VolumeBarH) * 0.5f;
         if (RetroBar("##vol", _volume, volPos, { volBarW, Theme::VolumeBarH }))
             Event::Emit(VolumeChangeEvent{ _volume });
+    }
+
+    // ---- Status bar ---------------------------------------------------------
+    {
+        ImGui::Spacing();
+        if (_queueSize > 0) {
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "%d/%d",
+                _queueIndex >= 0 ? _queueIndex + 1 : 0, _queueSize);
+            float tw = ImGui::CalcTextSize(buf).x;
+            ImGui::SetCursorPosX(pad + innerW - tw);
+            ImGui::PushStyleColor(ImGuiCol_Text, Theme::TextDim);
+            ImGui::TextUnformatted(buf);
+            ImGui::PopStyleColor();
+        }
     }
 
     ImGui::Spacing();
