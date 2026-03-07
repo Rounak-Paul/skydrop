@@ -70,6 +70,7 @@ static ALuint s_EffectSlot = 0;
 static ALuint s_Effect     = 0;
 static AudioPlayer::SpatialPreset s_SpatialPreset  = AudioPlayer::SpatialPreset::Off;
 static float                      s_SpatialAzimuth = 0.0f;
+static bool                       s_HRTFActive     = false; // mirrors actual device HRTF state
 
 // ---- EQ state -------------------------------------------------------------
 static ALuint s_EQSlot           = 0;    // auxiliary effect slot for equalizer
@@ -186,13 +187,14 @@ static void ApplySpatialState() {
 
     const bool spatial = (s_SpatialPreset != AudioPlayer::SpatialPreset::Off);
 
-    // 1) HRTF toggle via ALC_SOFT_HRTF device reset
-    if (s_HasHRTF) {
+    // 1) HRTF toggle via ALC_SOFT_HRTF device reset — only when state actually changes
+    if (s_HasHRTF && spatial != s_HRTFActive) {
         const ALCint hrtfAttrs[] = {
             ALC_HRTF_SOFT, spatial ? ALC_TRUE : ALC_FALSE,
             0
         };
         alcResetDeviceSOFT(s_Device, hrtfAttrs);
+        s_HRTFActive = spatial;
     }
 
     if (!spatial) {
@@ -652,9 +654,10 @@ static bool DecodeFile(
 // ---- Loader thread body ---------------------------------------------------
 
 static void AudioLoaderThread() {
-    // OpenAL contexts are per-thread on some platforms; on others the context
-    // set by Init() is already current everywhere.  We just use the existing
-    // context — alcMakeContextCurrent is already done on the main thread.
+    // OpenAL Soft (Linux) requires the context to be made current on every
+    // thread that issues AL calls. macOS system OpenAL is more lenient, but
+    // calling this here is correct and harmless on all platforms.
+    alcMakeContextCurrent(s_Context);
 
     while (true) {
         std::string path;
@@ -702,13 +705,11 @@ static void AudioLoaderThread() {
                          static_cast<ALsizei>(pcm.size() * sizeof(int16_t)),
                          static_cast<ALsizei>(sampleRate));
             alSourcei(s_Source, AL_BUFFER, static_cast<ALint>(s_Buffer));
-            alSourcePlay(s_Source);
 
             s_Title    = title;
             s_Artist   = artist;
             s_Album    = album;
             s_Duration = duration;
-            s_WasPlaying = true;
 
             s_ArtPixels = std::move(artPixels);
             s_ArtWidth  = hasArt ? artW : 0;
@@ -716,8 +717,12 @@ static void AudioLoaderThread() {
 
             s_Waveform = std::move(waveform);
 
-            // Re-apply spatial settings to the new source (position, reverb)
+            // Apply spatial settings BEFORE starting playback so that any
+            // alcResetDeviceSOFT call inside doesn't interrupt audio.
             ApplySpatialState();
+
+            alSourcePlay(s_Source);
+            s_WasPlaying = true;
         }
 
         // Notify UI (safe — Event::Emit is mutex-protected inside event.cc)
