@@ -33,4 +33,6 @@ private:
     // Album art texture (Vulkan-backed, rendered via ImGui)
     static tvk::Ref<tvk::Texture> _artTexture;
     static bool _pendingRebuildArt;
+    static int  _artTexW; // original pixel dimensions for UV cover-crop
+    static int  _artTexH;
 };

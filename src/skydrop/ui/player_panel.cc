@@ -30,6 +30,8 @@ float       PlayerPanel::_volume  = 1.0f;
 
 tvk::Ref<tvk::Texture> PlayerPanel::_artTexture;
 bool                   PlayerPanel::_pendingRebuildArt = true;
+int                    PlayerPanel::_artTexW = 1;
+int                    PlayerPanel::_artTexH = 1;
 
 // ---- Helpers ------------------------------------------------------------
 
@@ -64,7 +66,7 @@ static bool TransportBtn(const char* label) {
     return ImGui::Button(label, { Theme::TransportBtnW, Theme::TransportBtnH });
 }
 
-// Toggle button — lights up when active
+// Toggle button — lights up when active; icon-only size
 static bool ToggleBtn(const char* label, bool active) {
     if (active) {
         ImGui::PushStyleColor(ImGuiCol_Button,        Theme::BtnActive);
@@ -84,11 +86,15 @@ void PlayerPanel::RebuildArtTexture() {
     int artW = 0, artH = 0;
 
     if (AudioPlayer::CopyAlbumArt(artPixels, artW, artH)) {
+        _artTexW = artW;
+        _artTexH = artH;
         _artTexture = tvk::Texture::Create(
             renderer, artPixels.data(),
             static_cast<tvk::u32>(artW), static_cast<tvk::u32>(artH),
             tvk::TextureSpec{ .generateMipmaps = false });
     } else {
+        _artTexW = 1;
+        _artTexH = 1;
         static const uint8_t grey[4] = { 20, 14, 3, 255 };
         _artTexture = tvk::Texture::Create(renderer, grey, 1, 1,
             tvk::TextureSpec{ .width = 1, .height = 1, .generateMipmaps = false });
@@ -130,168 +136,163 @@ void PlayerPanel::OnUI() {
         _pendingRebuildArt = false;
     }
 
-    ImDrawList* dl     = ImGui::GetWindowDrawList();
-    const float availW = ImGui::GetContentRegionAvail().x;
-    const float padX   = ImGui::GetStyle().WindowPadding.x;
+    ImDrawList* dl      = ImGui::GetWindowDrawList();
+    const float fullW   = ImGui::GetContentRegionAvail().x;
+    const float availH  = ImGui::GetContentRegionAvail().y;
+    const float lineH   = ImGui::GetTextLineHeight();
+    const float pad     = Theme::WindowPadX;
+    const float innerW  = fullW - pad * 2.0f; // width for padded controls
 
     // -------------------------------------------------------------------------
-    // Art
+    // Art block — fills full width, height proportional
     // -------------------------------------------------------------------------
-    float artSize = std::clamp(availW * Theme::ArtMaxFrac,
-                               Theme::ArtMinPx, Theme::ArtMaxPx);
-    float artOffX = (availW - artSize) * 0.5f;
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + artOffX);
+    const float artH = std::min(fullW * 0.72f, availH * 0.50f);
+    const float artW = fullW;
 
     ImVec2 artTL = ImGui::GetCursorScreenPos();
-    ImVec2 artBR = { artTL.x + artSize, artTL.y + artSize };
+    ImVec2 artBR = { artTL.x + artW, artTL.y + artH };
 
-    // Draw art image (or placeholder)
-    if (_artTexture && _artTexture->IsValid()) {
-        ImGui::Image(
+    // Art image or placeholder (all via DrawList — no cursor advance yet)
+    if (_artTexture && _artTexture->IsValid() && (_artTexW > 1 || _artTexH > 1)) {
+        // Scale-to-fill (cover): maintain aspect ratio, center-crop
+        float scaleX = artW / static_cast<float>(_artTexW);
+        float scaleY = artH / static_cast<float>(_artTexH);
+        float scale  = std::max(scaleX, scaleY);
+        float scaledW = _artTexW * scale;
+        float scaledH = _artTexH * scale;
+        float uvOffX  = (scaledW - artW) / (2.0f * scaledW);
+        float uvOffY  = (scaledH - artH) / (2.0f * scaledH);
+        ImVec2 uv0 = { uvOffX,         uvOffY         };
+        ImVec2 uv1 = { 1.0f - uvOffX,  1.0f - uvOffY  };
+        dl->AddImage(
             reinterpret_cast<ImTextureID>(_artTexture->GetImGuiTextureID()),
-            { artSize, artSize });
+            artTL, artBR, uv0, uv1);
     } else {
-        // Placeholder: dark amber patterned box
-        dl->AddRectFilled(artTL, artBR, Theme::U32ArtBorder);
-        dl->AddRectFilled(
-            { artTL.x + 2, artTL.y + 2 }, { artBR.x - 2, artBR.y - 2 },
-            Theme::U32BgChild);
-        // Centred music note icon
+        dl->AddRectFilled(artTL, artBR, Theme::U32BgChild);
         ImVec2 noteSize = ImGui::CalcTextSize(ICON_FA_MUSIC);
-        dl->AddText(
-            { artTL.x + (artSize - noteSize.x) * 0.5f,
-              artTL.y + (artSize - noteSize.y) * 0.5f },
+        dl->AddText(nullptr, 0.0f,
+            { artTL.x + (artW - noteSize.x) * 0.5f,
+              artTL.y + (artH - noteSize.y) * 0.5f },
             Theme::U32AccentDim, ICON_FA_MUSIC);
-        ImGui::Dummy({ artSize, artSize });
     }
 
-    // Scanline overlay + border drawn ON TOP of art
+    // Scanlines
     Theme::DrawScanlines(dl, artTL, artBR);
-    // Dim overlay for depth
-    dl->AddRectFilled(artTL, artBR, Theme::U32ArtOverlay);
+
+    // Dark gradient rising from the bottom — makes text legible
+    const float gradH  = artH * 0.60f;
+    ImVec2      gradTL = { artTL.x, artBR.y - gradH };
+    dl->AddRectFilledMultiColor(
+        gradTL, artBR,
+        IM_COL32(5, 3, 1,   0), IM_COL32(5, 3, 1,   0),  // top: transparent
+        IM_COL32(5, 3, 1, 240), IM_COL32(5, 3, 1, 240)); // bottom: near-opaque
+
     // Amber border
-    dl->AddRect(artTL, artBR, Theme::U32ArtBorder, 0.0f, 0, 1.5f);
+    dl->AddRect(artTL, artBR, Theme::U32ArtBorder, 0.0f, 0, 1.0f);
 
+    // ---- Text overlay at bottom of art ------------------------------------
+    const float textPad  = pad;
+    const float textMaxW = artW - textPad * 2.0f;
+    const bool  hasTitle  = !_title.empty();
+    const bool  hasArtist = !_artist.empty();
+
+    // Bottom-anchored: figure out total block height
+    int lines   = 1 + (hasArtist ? 1 : 0);
+    float blockH = lines * lineH + (lines - 1) * 2.0f;
+    float textY  = artBR.y - blockH - textPad;
+
+    {
+        const char* titleStr = hasTitle ? _title.c_str() : "No track loaded";
+        dl->AddText(nullptr, 0.0f,
+            { artTL.x + textPad, textY },
+            Theme::U32TextPrimary,
+            titleStr, nullptr, textMaxW);
+        textY += lineH + 2.0f;
+    }
+    if (hasArtist) {
+        dl->AddText(nullptr, 0.0f,
+            { artTL.x + textPad, textY },
+            Theme::U32TextDim,
+            _artist.c_str(), nullptr, textMaxW);
+    }
+
+    // Advance cursor past the art block
+    ImGui::Dummy({ artW, artH });
+
+    // =========================================================================
+    // Controls — use padded inner region
+    // =========================================================================
+    ImGui::SetCursorPosX(pad);
     ImGui::Spacing();
 
-    // -------------------------------------------------------------------------
-    // Metadata
-    // -------------------------------------------------------------------------
-    ImGui::PushStyleColor(ImGuiCol_Text, Theme::TextBright);
-    if (!_title.empty()) {
-        float tw = ImGui::CalcTextSize(_title.c_str()).x;
-        if (tw < availW)
-            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (availW - tw) * 0.5f);
-        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + availW);
-        ImGui::TextUnformatted(_title.c_str());
-        ImGui::PopTextWrapPos();
-    } else {
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (availW - ImGui::CalcTextSize("No track loaded").x) * 0.5f);
-        ImGui::TextUnformatted("No track loaded");
-    }
-    ImGui::PopStyleColor();
-
-    ImGui::PushStyleColor(ImGuiCol_Text, Theme::TextDim);
-    if (!_artist.empty()) {
-        float tw = ImGui::CalcTextSize(_artist.c_str()).x;
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (availW - tw) * 0.5f);
-        ImGui::TextUnformatted(_artist.c_str());
-    }
-    if (!_album.empty()) {
-        float tw = ImGui::CalcTextSize(_album.c_str()).x;
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (availW - tw) * 0.5f);
-        ImGui::TextUnformatted(_album.c_str());
-    }
-    ImGui::PopStyleColor();
-
-    ImGui::Spacing();
-
-    // -------------------------------------------------------------------------
-    // Seek bar (retro segmented)
-    // -------------------------------------------------------------------------
+    // ---- Seek bar -----------------------------------------------------------
     float progress = (_dur > 0.0f) ? (_pos / _dur) : 0.0f;
-    const float barW = availW;
-    const float barH = Theme::SeekBarH;
 
+    ImGui::SetCursorPosX(pad);
     ImVec2 seekPos = ImGui::GetCursorScreenPos();
-    if (RetroBar("##seek", progress, seekPos, { barW, barH }))
+    if (RetroBar("##seek", progress, seekPos, { innerW, Theme::SeekBarH }))
         Event::Emit(SeekEvent{ progress * _dur });
 
-    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 2.0f);
-
-    // Time stamps flanking the bar
+    // Time stamps
     std::string tLeft  = FormatTime(_pos);
     std::string tRight = FormatTime(_dur);
     ImGui::PushStyleColor(ImGuiCol_Text, Theme::TextDim);
+    ImGui::SetCursorPosX(pad);
     ImGui::TextUnformatted(tLeft.c_str());
-    ImGui::SameLine(availW - ImGui::CalcTextSize(tRight.c_str()).x + padX * 0.5f);
+    ImGui::SameLine(pad + innerW - ImGui::CalcTextSize(tRight.c_str()).x);
     ImGui::TextUnformatted(tRight.c_str());
     ImGui::PopStyleColor();
 
-    ImGui::Spacing();
-
-    // -------------------------------------------------------------------------
-    // Transport buttons — centred row
-    // -------------------------------------------------------------------------
+    // ---- Transport buttons --------------------------------------------------
+    ImGui::SetWindowFontScale(1.15f);
     {
-        float spacing   = ImGui::GetStyle().ItemSpacing.x;
-        float rowW      = 4.0f * Theme::TransportBtnW + 3.0f * spacing;
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (availW - rowW) * 0.5f);
+        const float spacing = ImGui::GetStyle().ItemSpacing.x;
+        const float rowW    = 3.0f * Theme::TransportBtnW + 2.0f * spacing;
+        ImGui::SetCursorPosX(pad + (innerW - rowW) * 0.5f);
 
-        if (TransportBtn(ICON_FA_BACKWARD_STEP))                     Event::Emit(SkipPrevEvent{});
+        if (TransportBtn(ICON_FA_BACKWARD_STEP)) Event::Emit(SkipPrevEvent{});
         ImGui::SameLine();
         const char* playIcon = (_playing && !_paused) ? ICON_FA_PAUSE : ICON_FA_PLAY;
-        if (TransportBtn(playIcon))                                   Event::Emit(PauseToggleEvent{});
+        if (TransportBtn(playIcon))              Event::Emit(PauseToggleEvent{});
         ImGui::SameLine();
-        if (TransportBtn(ICON_FA_STOP))                               Event::Emit(StopEvent{});
-        ImGui::SameLine();
-        if (TransportBtn(ICON_FA_FORWARD_STEP))                       Event::Emit(SkipNextEvent{});
+        if (TransportBtn(ICON_FA_FORWARD_STEP))  Event::Emit(SkipNextEvent{});
     }
 
-    ImGui::Spacing();
-
-    // -------------------------------------------------------------------------
-    // Toggle row — shuffle + repeat, centred
-    // -------------------------------------------------------------------------
+    // ---- Toggle row (shuffle + repeat) --------------------------------------
     {
-        float spacing   = ImGui::GetStyle().ItemSpacing.x;
-        float rowW      = 2.0f * Theme::ToggleBtnW + spacing;
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (availW - rowW) * 0.5f);
+        const float spacing = ImGui::GetStyle().ItemSpacing.x;
+        const float rowW    = 2.0f * Theme::ToggleBtnW + spacing;
+        ImGui::SetCursorPosX(pad + (innerW - rowW) * 0.5f);
 
         bool shuffled = MusicQueue::IsShuffled();
-        if (ToggleBtn(ICON_FA_SHUFFLE "  Shuf", shuffled))
+        if (ToggleBtn(ICON_FA_SHUFFLE, shuffled))
             Event::Emit(ShuffleToggleEvent{});
-
         ImGui::SameLine();
 
         RepeatMode rm = MusicQueue::RepeatMode_();
-        const char* repeatLabel = (rm == RepeatMode::All)  ? ICON_FA_REPEAT "  All"
-                                : (rm == RepeatMode::One)  ? ICON_FA_REPEAT "  One"
-                                :                            ICON_FA_REPEAT "  Off";
-        if (ToggleBtn(repeatLabel, rm != RepeatMode::None))
+        // None → ban, All → rotate, One → rotate-right
+        const char* repeatIcon = (rm == RepeatMode::All) ? ICON_FA_ROTATE
+                                : (rm == RepeatMode::One) ? ICON_FA_ROTATE_RIGHT
+                                :                           ICON_FA_BAN;
+        if (ToggleBtn(repeatIcon, rm != RepeatMode::None))
             Event::Emit(RepeatToggleEvent{});
     }
+    ImGui::SetWindowFontScale(1.0f);
 
-    ImGui::Spacing();
-
-    // -------------------------------------------------------------------------
-    // Volume (retro segmented)
-    // -------------------------------------------------------------------------
+    // ---- Volume bar ---------------------------------------------------------
     {
-        float iconW  = ImGui::CalcTextSize(ICON_FA_VOLUME_HIGH).x + ImGui::GetStyle().ItemSpacing.x;
-        float volBarW = availW - iconW;
+        ImGui::SetCursorPosX(pad);
+        float iconW   = ImGui::CalcTextSize(ICON_FA_VOLUME_HIGH).x
+                      + ImGui::GetStyle().ItemSpacing.x;
+        float volBarW = innerW - iconW;
 
         ImGui::PushStyleColor(ImGuiCol_Text, Theme::AccentDim);
         ImGui::TextUnformatted(ICON_FA_VOLUME_HIGH);
         ImGui::PopStyleColor();
         ImGui::SameLine();
 
-        ImVec2 volPos  = ImGui::GetCursorScreenPos();
-        float  volOff  = (Theme::VolumeBarH < ImGui::GetTextLineHeight())
-                       ? (ImGui::GetTextLineHeight() - Theme::VolumeBarH) * 0.5f
-                       : 0.0f;
-        volPos.y += volOff;
-
+        ImVec2 volPos = ImGui::GetCursorScreenPos();
+        volPos.y += (lineH - Theme::VolumeBarH) * 0.5f;
         if (RetroBar("##vol", _volume, volPos, { volBarW, Theme::VolumeBarH }))
             Event::Emit(VolumeChangeEvent{ _volume });
     }

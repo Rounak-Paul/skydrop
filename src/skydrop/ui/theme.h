@@ -74,9 +74,9 @@ static constexpr ImU32 U32NowPlaying   = IM_COL32(255, 210,  80, 255); // active
 
 static constexpr float MenuBarH         = 20.0f;
 static constexpr float TabBarH          = 22.0f;
-static constexpr float TransportBtnW    = 34.0f;
-static constexpr float TransportBtnH    = 24.0f;
-static constexpr float ToggleBtnW       = 52.0f;    // shuffle / repeat
+static constexpr float TransportBtnW    = 36.0f;
+static constexpr float TransportBtnH    = 26.0f;
+static constexpr float ToggleBtnW       = 36.0f;    // icon-only toggle
 static constexpr float SeekBarH         = 10.0f;
 static constexpr float VolumeBarH       = 10.0f;
 static constexpr float ArtMaxFrac       = 0.72f;    // fraction of content width

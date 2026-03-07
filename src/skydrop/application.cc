@@ -13,7 +13,6 @@
 
 #include <imgui.h>
 #include <tinyvk/assets/icons_font_awesome.h>
-#include <GLFW/glfw3.h>
 
 void SkyDropApp::OnStart() {
     Event::Init();
@@ -23,10 +22,6 @@ void SkyDropApp::OnStart() {
 
     Theme::Apply();
     SetClearColor(0.047f, 0.035f, 0.008f, 1.0f);
-
-    glfwSetWindowSizeLimits(
-        static_cast<GLFWwindow*>(GetWindow()->GetNativeHandle()),
-        200, 300, 300, 500);
 
     PlayerPanel::Init();
     QueuePanel::Init();
@@ -93,7 +88,9 @@ void SkyDropApp::OnUI() {
       | ImGuiWindowFlags_NoBringToFrontOnFocus
       | ImGuiWindowFlags_NoScrollWithMouse
       | ImGuiWindowFlags_NoSavedSettings;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
     ImGui::Begin("##shell", nullptr, wf);
+    ImGui::PopStyleVar();
 
     if (ImGui::BeginTabBar("##tabs")) {
         if (ImGui::BeginTabItem(ICON_FA_MUSIC " Player")) {
