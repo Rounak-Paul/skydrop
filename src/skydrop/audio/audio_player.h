@@ -38,4 +38,24 @@ public:
     static std::string GetTitle();
     static std::string GetArtist();
     static std::string GetAlbum();
+
+    // ---- Waveform -----------------------------------------------------------
+    // 1024 normalised mono RMS peaks [0,1].  Populated after each Load().
+    // WaveformReadyEvent is emitted from the audio thread when ready.
+    static bool CopyWaveform(std::vector<float>& peaks);
+
+    // ---- Spatial / HRTF audio -----------------------------------------------
+    enum class SpatialPreset { Off, Room, ConcertHall, OpenAir };
+
+    static void          SetSpatialPreset(SpatialPreset p);
+    static SpatialPreset GetSpatialPreset();
+
+    // Azimuth in degrees: 0 = front, +90 = right, ±180 = behind.
+    static void  SetSpatialAzimuth(float degrees);
+    static float GetSpatialAzimuth();
+
+    // ---- Equalizer ----------------------------------------------------------
+    // Linear gains in [0.126, 7.943]  (≈ −18 dB … +18 dB). Default 1.0 = flat.
+    static void SetEQBands(float bassGain, float midGain, float trebleGain);
+    static void GetEQBands(float& bassGain, float& midGain, float& trebleGain);
 };

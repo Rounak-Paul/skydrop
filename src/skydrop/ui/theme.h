@@ -81,6 +81,7 @@ static constexpr float TransportBtnH    = 22.0f;
 static constexpr float ToggleBtnW       = 32.0f;    // icon-only toggle
 static constexpr float StatusBarH       = 14.0f;
 static constexpr float SeekBarH         = 10.0f;
+static constexpr float WaveformH        = 30.0f;    // waveform seek widget
 static constexpr float VolumeBarH       = 10.0f;
 static constexpr float ArtMaxFrac       = 0.72f;    // fraction of content width
 static constexpr float ArtMinPx         = 100.0f;

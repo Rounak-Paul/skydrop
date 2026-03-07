@@ -14,16 +14,25 @@
 // stb_image for JPEG/PNG art blobs — implementation is in tinyvk, we just need the declarations
 #include <stb_image.h>
 
+// Enable prototype declarations for all OpenAL extension functions
+// (EFX, HRTF, etc.)  — must be defined before any AL header
+#define AL_ALEXT_PROTOTYPES
+
 #include <AL/al.h>
 #include <AL/alc.h>
+#include <AL/alext.h>
+#include <AL/efx.h>
+#include <AL/efx-presets.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <filesystem>
 #include <mutex>
+#include <numeric>
 #include <string>
 #include <thread>
 #include <vector>
@@ -49,6 +58,26 @@ static std::vector<uint8_t> s_ArtPixels;
 static int                  s_ArtWidth  = 0;
 static int                  s_ArtHeight = 0;
 
+// ---- Waveform state -------------------------------------------------------
+static constexpr int kWaveformBins = 1024;
+static std::vector<float> s_Waveform; // normalized RMS peaks [0,1]
+
+// ---- Spatial / HRTF state ------------------------------------------------
+static bool s_HasHRTF     = false;
+static bool s_HasEFX      = false;
+static ALuint s_EffectSlot = 0;
+static ALuint s_Effect     = 0;
+static AudioPlayer::SpatialPreset s_SpatialPreset  = AudioPlayer::SpatialPreset::Off;
+static float                      s_SpatialAzimuth = 0.0f;
+
+// ---- EQ state -------------------------------------------------------------
+static ALuint s_EQSlot           = 0;    // auxiliary effect slot for equalizer
+static ALuint s_EQEffect         = 0;    // AL_EFFECT_EQUALIZER object
+static ALuint s_DirectMuteFilter = 0;    // low-pass filter with gain=0 to mute direct path
+static float  s_BassGain         = 1.0f; // linear gain for low band  [0.126, 7.943]
+static float  s_MidGain          = 1.0f; // linear gain for mid bands [0.126, 7.943]
+static float  s_TrebleGain       = 1.0f; // linear gain for high band [0.126, 7.943]
+
 // ---- Audio loader thread --------------------------------------------------
 
 static std::thread              s_LoadThread;
@@ -71,6 +100,203 @@ static void ClearSourceBuffer() {
     alSourceStop(s_Source);
     alSourcei(s_Source, AL_BUFFER, 0);
     if (s_Buffer) { alDeleteBuffers(1, &s_Buffer); s_Buffer = 0; }
+}
+
+// ---- Waveform helper (called from loader thread, no lock needed) ----------
+
+static std::vector<float> ComputeWaveform(const std::vector<int16_t>& pcm, uint32_t channels) {
+    std::vector<float> peaks(kWaveformBins, 0.0f);
+    const size_t totalFrames = pcm.size() / channels;
+    if (totalFrames == 0) return peaks;
+
+    const size_t framesPerBin = std::max<size_t>(1, totalFrames / kWaveformBins);
+    for (int bin = 0; bin < kWaveformBins; ++bin) {
+        const size_t start = static_cast<size_t>(bin) * framesPerBin;
+        const size_t end   = std::min(start + framesPerBin, totalFrames);
+        float sumSq = 0.0f;
+        for (size_t f = start; f < end; ++f) {
+            float mono = 0.0f;
+            for (uint32_t c = 0; c < channels; ++c)
+                mono += pcm[f * channels + c] * (1.0f / 32768.0f);
+            mono /= static_cast<float>(channels);
+            sumSq += mono * mono;
+        }
+        peaks[bin] = std::sqrt(sumSq / static_cast<float>(end - start));
+    }
+    const float maxPeak = *std::max_element(peaks.begin(), peaks.end());
+    if (maxPeak > 1e-6f)
+        for (auto& p : peaks) p /= maxPeak;
+    return peaks;
+}
+
+// ---- HRTF / EFX helpers (must be called while ALContext is current) ------
+
+static void ProbeExtensions() {
+    s_HasHRTF = (alcIsExtensionPresent(s_Device, "ALC_SOFT_HRTF") == ALC_TRUE);
+    s_HasEFX  = (alcIsExtensionPresent(s_Device, "ALC_EXT_EFX")   == ALC_TRUE);
+    if (s_HasEFX) {
+        // Slot 0: reverb (used only when spatial is on)
+        alGenAuxiliaryEffectSlots(1, &s_EffectSlot);
+        alGenEffects(1, &s_Effect);
+
+        // Slot 1: equalizer — always active, chains into reverb when spatial on
+        alGenAuxiliaryEffectSlots(1, &s_EQSlot);
+        alGenEffects(1, &s_EQEffect);
+        alEffecti(s_EQEffect, AL_EFFECT_TYPE, AL_EFFECT_EQUALIZER);
+        alAuxiliaryEffectSloti(s_EQSlot, AL_EFFECTSLOT_EFFECT,
+                               static_cast<ALint>(s_EQEffect));
+
+        // Zero-gain lowpass to mute the source's direct (dry) path;
+        // all audio is routed through the EQ slot instead.
+        alGenFilters(1, &s_DirectMuteFilter);
+        alFilteri(s_DirectMuteFilter, AL_FILTER_TYPE, AL_FILTER_LOWPASS);
+        alFilterf(s_DirectMuteFilter, AL_LOWPASS_GAIN,   0.0f);
+        alFilterf(s_DirectMuteFilter, AL_LOWPASS_GAINHF, 0.0f);
+    }
+}
+
+// Apply current EQ band gains and make the source route through the EQ slot.
+// Must be called while s_StateMutex is held and the AL context is current.
+static void ApplyEQState() {
+    if (!s_HasEFX || !s_EQSlot || !s_EQEffect || !s_Source) return;
+
+    // Mute the direct (dry) path — all audio goes out through aux sends.
+    if (s_DirectMuteFilter)
+        alSourcei(s_Source, AL_DIRECT_FILTER,
+                  static_cast<ALint>(s_DirectMuteFilter));
+
+    // Push updated band gains into the EQ effect.
+    alEffectf(s_EQEffect, AL_EQUALIZER_LOW_GAIN,  s_BassGain);
+    alEffectf(s_EQEffect, AL_EQUALIZER_MID1_GAIN, s_MidGain);
+    alEffectf(s_EQEffect, AL_EQUALIZER_MID2_GAIN, s_MidGain);
+    alEffectf(s_EQEffect, AL_EQUALIZER_HIGH_GAIN, s_TrebleGain);
+    alAuxiliaryEffectSloti(s_EQSlot, AL_EFFECTSLOT_EFFECT,
+                           static_cast<ALint>(s_EQEffect));
+
+    // Source always sends to the EQ slot on send index 0.
+    alSource3i(s_Source, AL_AUXILIARY_SEND_FILTER,
+               static_cast<ALint>(s_EQSlot), 0, AL_FILTER_NULL);
+}
+
+// Apply the current s_SpatialPreset + s_SpatialAzimuth to the OpenAL source.
+// Must be called under s_StateMutex.
+static void ApplySpatialState() {
+    if (!s_Source) return;
+
+    const bool spatial = (s_SpatialPreset != AudioPlayer::SpatialPreset::Off);
+
+    // 1) HRTF toggle via ALC_SOFT_HRTF device reset
+    if (s_HasHRTF) {
+        const ALCint hrtfAttrs[] = {
+            ALC_HRTF_SOFT, spatial ? ALC_TRUE : ALC_FALSE,
+            0
+        };
+        alcResetDeviceSOFT(s_Device, hrtfAttrs);
+    }
+
+    if (!spatial) {
+        // Non-spatial: relative source, no reverb
+        alSourcei(s_Source, AL_SOURCE_RELATIVE, AL_TRUE);
+        alSource3f(s_Source, AL_POSITION, 0.f, 0.f, 0.f);
+        if (s_HasEFX && s_EffectSlot) {
+            alAuxiliaryEffectSloti(s_EffectSlot, AL_EFFECTSLOT_EFFECT,
+                                   AL_EFFECT_NULL);
+            // Unchain EQ → reverb
+            if (s_EQSlot && alIsExtensionPresent("AL_SOFT_effect_target"))
+                alAuxiliaryEffectSloti(s_EQSlot, AL_EFFECTSLOT_TARGET_SOFT, 0);
+        }
+        ApplyEQState(); // reapply EQ send after any state reset
+        return;
+    }
+
+    // 2) Position source in 3D from azimuth (listener at origin, facing -Z)
+    alSourcei(s_Source, AL_SOURCE_RELATIVE, AL_FALSE);
+    const float radAz = s_SpatialAzimuth * (3.14159265358979f / 180.0f);
+    alSource3f(s_Source, AL_POSITION,
+               std::sin(radAz) * 1.5f,
+               0.f,
+               -std::cos(radAz) * 1.5f);
+
+    // Listener at origin, looking -Z, up +Y (explicit for safety)
+    const ALfloat ori[6] = { 0.f, 0.f, -1.f,   0.f, 1.f, 0.f };
+    alListenerfv(AL_ORIENTATION, ori);
+    alListener3f(AL_POSITION, 0.f, 0.f, 0.f);
+
+    // 3) EFX reverb preset
+    if (!s_HasEFX || !s_EffectSlot || !s_Effect) return;
+
+    EFXEAXREVERBPROPERTIES rev;
+    switch (s_SpatialPreset) {
+        case AudioPlayer::SpatialPreset::Room:
+            rev = EFXEAXREVERBPROPERTIES EFX_REVERB_PRESET_ROOM;
+            break;
+        case AudioPlayer::SpatialPreset::ConcertHall:
+            rev = EFXEAXREVERBPROPERTIES EFX_REVERB_PRESET_CONCERTHALL;
+            break;
+        case AudioPlayer::SpatialPreset::OpenAir:
+            rev = EFXEAXREVERBPROPERTIES EFX_REVERB_PRESET_OUTDOORS_ROLLINGPLAINS;
+            break;
+        default:
+            return;
+    }
+
+    alEffecti(s_Effect, AL_EFFECT_TYPE, AL_EFFECT_EAXREVERB);
+    if (alGetError() != AL_NO_ERROR) {
+        // Fallback to standard reverb
+        alEffecti(s_Effect, AL_EFFECT_TYPE, AL_EFFECT_REVERB);
+        alEffectf(s_Effect, AL_REVERB_DENSITY,               rev.flDensity);
+        alEffectf(s_Effect, AL_REVERB_DIFFUSION,             rev.flDiffusion);
+        alEffectf(s_Effect, AL_REVERB_GAIN,                  rev.flGain);
+        alEffectf(s_Effect, AL_REVERB_GAINHF,                rev.flGainHF);
+        alEffectf(s_Effect, AL_REVERB_DECAY_TIME,            rev.flDecayTime);
+        alEffectf(s_Effect, AL_REVERB_DECAY_HFRATIO,         rev.flDecayHFRatio);
+        alEffectf(s_Effect, AL_REVERB_REFLECTIONS_GAIN,      rev.flReflectionsGain);
+        alEffectf(s_Effect, AL_REVERB_REFLECTIONS_DELAY,     rev.flReflectionsDelay);
+        alEffectf(s_Effect, AL_REVERB_LATE_REVERB_GAIN,      rev.flLateReverbGain);
+        alEffectf(s_Effect, AL_REVERB_LATE_REVERB_DELAY,     rev.flLateReverbDelay);
+        alEffectf(s_Effect, AL_REVERB_AIR_ABSORPTION_GAINHF, rev.flAirAbsorptionGainHF);
+        alEffectf(s_Effect, AL_REVERB_ROOM_ROLLOFF_FACTOR,   rev.flRoomRolloffFactor);
+        alEffecti(s_Effect, AL_REVERB_DECAY_HFLIMIT,         rev.iDecayHFLimit);
+    } else {
+        alEffectf(s_Effect, AL_EAXREVERB_DENSITY,               rev.flDensity);
+        alEffectf(s_Effect, AL_EAXREVERB_DIFFUSION,             rev.flDiffusion);
+        alEffectf(s_Effect, AL_EAXREVERB_GAIN,                  rev.flGain);
+        alEffectf(s_Effect, AL_EAXREVERB_GAINHF,                rev.flGainHF);
+        alEffectf(s_Effect, AL_EAXREVERB_GAINLF,                rev.flGainLF);
+        alEffectf(s_Effect, AL_EAXREVERB_DECAY_TIME,            rev.flDecayTime);
+        alEffectf(s_Effect, AL_EAXREVERB_DECAY_HFRATIO,         rev.flDecayHFRatio);
+        alEffectf(s_Effect, AL_EAXREVERB_DECAY_LFRATIO,         rev.flDecayLFRatio);
+        alEffectf(s_Effect, AL_EAXREVERB_REFLECTIONS_GAIN,      rev.flReflectionsGain);
+        alEffectf(s_Effect, AL_EAXREVERB_REFLECTIONS_DELAY,     rev.flReflectionsDelay);
+        alEffectfv(s_Effect, AL_EAXREVERB_REFLECTIONS_PAN,      rev.flReflectionsPan);
+        alEffectf(s_Effect, AL_EAXREVERB_LATE_REVERB_GAIN,      rev.flLateReverbGain);
+        alEffectf(s_Effect, AL_EAXREVERB_LATE_REVERB_DELAY,     rev.flLateReverbDelay);
+        alEffectfv(s_Effect, AL_EAXREVERB_LATE_REVERB_PAN,      rev.flLateReverbPan);
+        alEffectf(s_Effect, AL_EAXREVERB_ECHO_TIME,             rev.flEchoTime);
+        alEffectf(s_Effect, AL_EAXREVERB_ECHO_DEPTH,            rev.flEchoDepth);
+        alEffectf(s_Effect, AL_EAXREVERB_MODULATION_TIME,       rev.flModulationTime);
+        alEffectf(s_Effect, AL_EAXREVERB_MODULATION_DEPTH,      rev.flModulationDepth);
+        alEffectf(s_Effect, AL_EAXREVERB_AIR_ABSORPTION_GAINHF, rev.flAirAbsorptionGainHF);
+        alEffectf(s_Effect, AL_EAXREVERB_HFREFERENCE,           rev.flHFReference);
+        alEffectf(s_Effect, AL_EAXREVERB_LFREFERENCE,           rev.flLFReference);
+        alEffectf(s_Effect, AL_EAXREVERB_ROOM_ROLLOFF_FACTOR,   rev.flRoomRolloffFactor);
+        alEffecti(s_Effect, AL_EAXREVERB_DECAY_HFLIMIT,         rev.iDecayHFLimit);
+    }
+
+    alAuxiliaryEffectSloti(s_EffectSlot, AL_EFFECTSLOT_EFFECT,
+                           static_cast<ALint>(s_Effect));
+
+    // Chain EQ slot → reverb slot so the EQ'd signal gets spatial reverb.
+    // The source itself only sends to the EQ slot (via ApplyEQState below).
+    if (s_EQSlot && alIsExtensionPresent("AL_SOFT_effect_target")) {
+        alAuxiliaryEffectSloti(s_EQSlot, AL_EFFECTSLOT_TARGET_SOFT,
+                               static_cast<ALint>(s_EffectSlot));
+    } else {
+        // Fallback: direct source send to reverb slot on send index 1
+        alSource3i(s_Source, AL_AUXILIARY_SEND_FILTER,
+                   static_cast<ALint>(s_EffectSlot), 1, AL_FILTER_NULL);
+    }
+    ApplyEQState(); // reapply EQ send after HRTF/spatial state changes
 }
 
 // ---- Art helpers ----------------------------------------------------------
@@ -460,6 +686,9 @@ static void AudioLoaderThread() {
         const float duration = static_cast<float>(pcm.size() / channels) / static_cast<float>(sampleRate);
         const bool  hasArt   = !artPixels.empty();
 
+        // --- Compute waveform from raw PCM (no lock, heavy but fast) ---
+        std::vector<float> waveform = ComputeWaveform(pcm, channels);
+
         // --- Upload to OpenAL + store state (must hold AL context) ---
         {
             std::lock_guard<std::mutex> lk(s_StateMutex);
@@ -483,10 +712,16 @@ static void AudioLoaderThread() {
             s_ArtPixels = std::move(artPixels);
             s_ArtWidth  = hasArt ? artW : 0;
             s_ArtHeight = hasArt ? artH : 0;
+
+            s_Waveform = std::move(waveform);
+
+            // Re-apply spatial settings to the new source (position, reverb)
+            ApplySpatialState();
         }
 
         // Notify UI (safe — Event::Emit is mutex-protected inside event.cc)
         Event::Emit(TrackChangedEvent{ title, artist, album, duration, hasArt });
+        Event::Emit(WaveformReadyEvent{});
     }
 }
 
@@ -504,6 +739,15 @@ int AudioPlayer::Init() {
     alSource3f(s_Source, AL_POSITION, 0.f, 0.f, 0.f);
     alSource3f(s_Source, AL_VELOCITY, 0.f, 0.f, 0.f);
     alSourcei(s_Source, AL_LOOPING, AL_FALSE);
+    alSourcei(s_Source, AL_SOURCE_RELATIVE, AL_TRUE); // default: non-spatial
+
+    // Listener at origin, looking -Z, up +Y
+    const ALfloat ori[6] = { 0.f, 0.f, -1.f,  0.f, 1.f, 0.f };
+    alListenerfv(AL_ORIENTATION, ori);
+    alListener3f(AL_POSITION, 0.f, 0.f, 0.f);
+
+    ProbeExtensions();
+    ApplyEQState(); // activate EQ slot routing from the start
 
     s_StopThread = false;
     s_LoadThread = std::thread(AudioLoaderThread);
@@ -519,6 +763,15 @@ void AudioPlayer::Shutdown() {
     }
     s_QueueCV.notify_one();
     if (s_LoadThread.joinable()) s_LoadThread.join();
+
+    // Cleanup EFX objects
+    if (s_HasEFX) {
+        if (s_EffectSlot)        { alDeleteAuxiliaryEffectSlots(1, &s_EffectSlot);    s_EffectSlot        = 0; }
+        if (s_Effect)            { alDeleteEffects(1, &s_Effect);                     s_Effect            = 0; }
+        if (s_EQSlot)            { alDeleteAuxiliaryEffectSlots(1, &s_EQSlot);        s_EQSlot            = 0; }
+        if (s_EQEffect)          { alDeleteEffects(1, &s_EQEffect);                   s_EQEffect          = 0; }
+        if (s_DirectMuteFilter)  { alDeleteFilters(1, &s_DirectMuteFilter);           s_DirectMuteFilter  = 0; }
+    }
 
     if (s_Source) { ClearSourceBuffer(); alDeleteSources(1, &s_Source); s_Source = 0; }
     if (s_Context) { alcMakeContextCurrent(nullptr); alcDestroyContext(s_Context); s_Context = nullptr; }
@@ -616,3 +869,62 @@ bool AudioPlayer::CopyAlbumArt(std::vector<uint8_t>& pixels, int& width, int& he
 std::string AudioPlayer::GetTitle()  { std::lock_guard<std::mutex> lk(s_StateMutex); return s_Title;  }
 std::string AudioPlayer::GetArtist() { std::lock_guard<std::mutex> lk(s_StateMutex); return s_Artist; }
 std::string AudioPlayer::GetAlbum()  { std::lock_guard<std::mutex> lk(s_StateMutex); return s_Album;  }
+
+// ---- Waveform -------------------------------------------------------------
+
+bool AudioPlayer::CopyWaveform(std::vector<float>& peaks) {
+    std::lock_guard<std::mutex> lk(s_StateMutex);
+    if (s_Waveform.empty()) return false;
+    peaks = s_Waveform;
+    return true;
+}
+
+// ---- Spatial / HRTF -------------------------------------------------------
+
+void AudioPlayer::SetSpatialPreset(SpatialPreset p) {
+    std::lock_guard<std::mutex> lk(s_StateMutex);
+    s_SpatialPreset = p;
+    ApplySpatialState();
+}
+
+AudioPlayer::SpatialPreset AudioPlayer::GetSpatialPreset() {
+    std::lock_guard<std::mutex> lk(s_StateMutex);
+    return s_SpatialPreset;
+}
+
+void AudioPlayer::SetSpatialAzimuth(float degrees) {
+    std::lock_guard<std::mutex> lk(s_StateMutex);
+    // Clamp to [-180, 180]
+    while (degrees >  180.0f) degrees -= 360.0f;
+    while (degrees < -180.0f) degrees += 360.0f;
+    s_SpatialAzimuth = degrees;
+    if (s_SpatialPreset != SpatialPreset::Off && s_Source) {
+        const float radAz = degrees * (3.14159265358979f / 180.0f);
+        alSource3f(s_Source, AL_POSITION,
+                   std::sin(radAz) * 1.5f,
+                   0.f,
+                   -std::cos(radAz) * 1.5f);
+    }
+}
+
+float AudioPlayer::GetSpatialAzimuth() {
+    std::lock_guard<std::mutex> lk(s_StateMutex);
+    return s_SpatialAzimuth;
+}
+
+// ---- Equalizer ------------------------------------------------------------
+
+void AudioPlayer::SetEQBands(float bassGain, float midGain, float trebleGain) {
+    std::lock_guard<std::mutex> lk(s_StateMutex);
+    s_BassGain   = std::clamp(bassGain,   AL_EQUALIZER_MIN_LOW_GAIN,  AL_EQUALIZER_MAX_LOW_GAIN);
+    s_MidGain    = std::clamp(midGain,    AL_EQUALIZER_MIN_MID1_GAIN, AL_EQUALIZER_MAX_MID1_GAIN);
+    s_TrebleGain = std::clamp(trebleGain, AL_EQUALIZER_MIN_HIGH_GAIN, AL_EQUALIZER_MAX_HIGH_GAIN);
+    ApplyEQState();
+}
+
+void AudioPlayer::GetEQBands(float& bassGain, float& midGain, float& trebleGain) {
+    std::lock_guard<std::mutex> lk(s_StateMutex);
+    bassGain   = s_BassGain;
+    midGain    = s_MidGain;
+    trebleGain = s_TrebleGain;
+}

@@ -68,6 +68,9 @@ struct PlaybackTickEvent {
     bool  isPaused;
 };
 
+// Fired when waveform peak data for the loaded track is ready
+struct WaveformReadyEvent {};
+
 // Fired by MusicQueue whenever the queue contents or current index change
 struct QueueChangedEvent {
     struct Entry {

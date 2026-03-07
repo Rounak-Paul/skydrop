@@ -4,6 +4,7 @@
 #include <tinyvk/renderer/texture.h>
 #include <memory>
 #include <string>
+#include <vector>
 
 class PlayerPanel {
 public:
@@ -18,6 +19,7 @@ private:
     static ListenerID _idTrackChanged;
     static ListenerID _idTick;
     static ListenerID _idQueueChanged;
+    static ListenerID _idWaveform;
 
     // Cached playback state (updated from PlaybackTickEvent)
     static float  _pos;
@@ -38,6 +40,15 @@ private:
     // Album art texture (Vulkan-backed, rendered via ImGui)
     static tvk::Ref<tvk::Texture> _artTexture;
     static bool _pendingRebuildArt;
-    static int  _artTexW; // original pixel dimensions for UV cover-crop
+    static int  _artTexW;
     static int  _artTexH;
+
+    // Waveform (1024 normalized RMS peaks)
+    static std::vector<float> _waveform;
+    static std::string        _currentTrackPath;  // for annotation lookup
+
+    // Annotation popup state
+    static bool  _showAnnotPopup;
+    static float _annotPopupPos;    // seconds
+    static char  _annotInputBuf[256];
 };

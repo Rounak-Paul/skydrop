@@ -2,11 +2,13 @@
 
 #include "event.h"
 #include "job_system.h"
+#include "annotations.h"
 #include "audio/audio_player.h"
 #include "audio/music_queue.h"
 #include "ui/menu_bar.h"
 #include "ui/player_panel.h"
 #include "ui/queue_panel.h"
+#include "ui/sound_panel.h"
 #include "ui/theme.h"
 #include "ui/ui_events.h"
 #include "ui/music_events.h"
@@ -19,6 +21,7 @@ void SkyDropApp::OnStart() {
     JobSystem::Init();
     AudioPlayer::Init();
     MusicQueue::Init();
+    Annotations::Init();
 
     Theme::Apply();
     SetClearColor(0.047f, 0.035f, 0.008f, 1.0f);
@@ -53,6 +56,7 @@ void SkyDropApp::OnStop() {
     QueuePanel::Shutdown();
     PlayerPanel::Shutdown();
     MusicQueue::Shutdown();
+    Annotations::Shutdown();
     AudioPlayer::Shutdown();
     JobSystem::Shutdown();
     Event::Shutdown();
@@ -93,12 +97,16 @@ void SkyDropApp::OnUI() {
     ImGui::PopStyleVar();
 
     if (ImGui::BeginTabBar("##tabs")) {
-        if (ImGui::BeginTabItem(ICON_FA_MUSIC " Player")) {
+        if (ImGui::BeginTabItem(ICON_FA_MUSIC)) {
             PlayerPanel::OnUI();
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem(ICON_FA_LIST " Queue")) {
+        if (ImGui::BeginTabItem(ICON_FA_LIST)) {
             QueuePanel::OnUI();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem(ICON_FA_HEADPHONES)) {
+            SoundPanel::OnUI();
             ImGui::EndTabItem();
         }
         ImGui::EndTabBar();
