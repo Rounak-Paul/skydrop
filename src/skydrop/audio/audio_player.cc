@@ -1,6 +1,7 @@
 #include "audio_player.h"
 #include "ui/music_events.h"
 #include "event.h"
+#include <cstring>
 
 // Single-header audio decoders (each compiled once here)
 #define DR_WAV_IMPLEMENTATION
