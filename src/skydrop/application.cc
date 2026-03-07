@@ -5,13 +5,15 @@
 #include "audio/audio_player.h"
 #include "audio/music_queue.h"
 #include "ui/menu_bar.h"
-#include "ui/stats_panel.h"
 #include "ui/player_panel.h"
 #include "ui/queue_panel.h"
+#include "ui/theme.h"
 #include "ui/ui_events.h"
 #include "ui/music_events.h"
 
 #include <imgui.h>
+#include <tinyvk/assets/icons_font_awesome.h>
+#include <GLFW/glfw3.h>
 
 void SkyDropApp::OnStart() {
     Event::Init();
@@ -19,9 +21,13 @@ void SkyDropApp::OnStart() {
     AudioPlayer::Init();
     MusicQueue::Init();
 
-    SetClearColor(0.1f, 0.1f, 0.12f, 1.0f);
+    Theme::Apply();
+    SetClearColor(0.047f, 0.035f, 0.008f, 1.0f);
 
-    StatsPanel::Init();
+    glfwSetWindowSizeLimits(
+        static_cast<GLFWwindow*>(GetWindow()->GetNativeHandle()),
+        200, 300, 300, 500);
+
     PlayerPanel::Init();
     QueuePanel::Init();
 
@@ -51,7 +57,6 @@ void SkyDropApp::OnStop() {
 
     QueuePanel::Shutdown();
     PlayerPanel::Shutdown();
-    StatsPanel::Shutdown();
     MusicQueue::Shutdown();
     AudioPlayer::Shutdown();
     JobSystem::Shutdown();
@@ -71,13 +76,6 @@ void SkyDropApp::OnUpdate() {
         AudioPlayer::IsPaused()
     });
 
-    Event::Emit(StatsUpdatedEvent{
-        FPS(),
-        DeltaTime() * 1000.0f,
-        ElapsedTime(),
-        WindowWidth(),
-        WindowHeight()
-    });
 }
 
 void SkyDropApp::OnMenuBar() {
@@ -85,10 +83,29 @@ void SkyDropApp::OnMenuBar() {
 }
 
 void SkyDropApp::OnUI() {
-    ImGuiViewport* viewport = ImGui::GetMainViewport();
-    ImGui::DockSpaceOverViewport(0, viewport);
+    ImGuiViewport* vp = ImGui::GetMainViewport();
+    const float menuH = ImGui::GetFrameHeight();
+    ImGui::SetNextWindowPos({ vp->Pos.x, vp->Pos.y + menuH });
+    ImGui::SetNextWindowSize({ vp->Size.x, vp->Size.y - menuH });
+    constexpr ImGuiWindowFlags wf =
+        ImGuiWindowFlags_NoDecoration
+      | ImGuiWindowFlags_NoMove
+      | ImGuiWindowFlags_NoBringToFrontOnFocus
+      | ImGuiWindowFlags_NoScrollWithMouse
+      | ImGuiWindowFlags_NoSavedSettings;
+    ImGui::Begin("##shell", nullptr, wf);
 
-    PlayerPanel::OnUI();
-    QueuePanel::OnUI();
-    StatsPanel::OnUI();
+    if (ImGui::BeginTabBar("##tabs")) {
+        if (ImGui::BeginTabItem(ICON_FA_MUSIC " Player")) {
+            PlayerPanel::OnUI();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem(ICON_FA_LIST " Queue")) {
+            QueuePanel::OnUI();
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
+
+    ImGui::End();
 }

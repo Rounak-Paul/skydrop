@@ -1,5 +1,6 @@
 #include "player_panel.h"
 
+#include "theme.h"
 #include "music_events.h"
 #include "audio/audio_player.h"
 #include "audio/music_queue.h"
@@ -8,7 +9,9 @@
 #include <tinyvk/assets/icons_font_awesome.h>
 #include <imgui.h>
 
+#include <algorithm>
 #include <cstdio>
+#include <string>
 #include <vector>
 
 // ---- Statics ------------------------------------------------------------
@@ -38,6 +41,41 @@ static std::string FormatTime(float s) {
     return buf;
 }
 
+// Retro segmented seek/volume widget.
+// Draws via DrawList at `pos`, InvisibleButton for interaction.
+// Returns true + updates `value` when user drags/clicks.
+static bool RetroBar(const char* id, float& value, ImVec2 pos, ImVec2 size) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    Theme::DrawSegBar(dl, pos, size, value);
+    ImGui::SetCursorScreenPos(pos);
+    ImGui::InvisibleButton(id, size);
+    bool changed = false;
+    if (ImGui::IsItemActive()) {
+        float mx    = ImGui::GetIO().MousePos.x;
+        float newV  = (mx - pos.x) / size.x;
+        value  = std::clamp(newV, 0.0f, 1.0f);
+        changed = true;
+    }
+    return changed;
+}
+
+// Themed transport button — boxy, amber-on-dark
+static bool TransportBtn(const char* label) {
+    return ImGui::Button(label, { Theme::TransportBtnW, Theme::TransportBtnH });
+}
+
+// Toggle button — lights up when active
+static bool ToggleBtn(const char* label, bool active) {
+    if (active) {
+        ImGui::PushStyleColor(ImGuiCol_Button,        Theme::BtnActive);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, Theme::BtnActiveHot);
+        ImGui::PushStyleColor(ImGuiCol_Text,          Theme::TextBright);
+    }
+    bool clicked = ImGui::Button(label, { Theme::ToggleBtnW, Theme::TransportBtnH });
+    if (active) ImGui::PopStyleColor(3);
+    return clicked;
+}
+
 void PlayerPanel::RebuildArtTexture() {
     tvk::Renderer* renderer = tvk::App::Get()->GetRenderer();
     if (!renderer) return;
@@ -47,14 +85,11 @@ void PlayerPanel::RebuildArtTexture() {
 
     if (AudioPlayer::CopyAlbumArt(artPixels, artW, artH)) {
         _artTexture = tvk::Texture::Create(
-            renderer,
-            artPixels.data(),
-            static_cast<tvk::u32>(artW),
-            static_cast<tvk::u32>(artH),
+            renderer, artPixels.data(),
+            static_cast<tvk::u32>(artW), static_cast<tvk::u32>(artH),
             tvk::TextureSpec{ .generateMipmaps = false });
     } else {
-        // 1×1 grey placeholder
-        static const uint8_t grey[4] = { 80, 80, 80, 255 };
+        static const uint8_t grey[4] = { 20, 14, 3, 255 };
         _artTexture = tvk::Texture::Create(renderer, grey, 1, 1,
             tvk::TextureSpec{ .width = 1, .height = 1, .generateMipmaps = false });
     }
@@ -66,11 +101,11 @@ void PlayerPanel::RebuildArtTexture() {
 
 void PlayerPanel::Init() {
     _idTrackChanged = Event::Register<TrackChangedEvent>([](const TrackChangedEvent& e) {
-        _title               = e.title;
-        _artist              = e.artist;
-        _album               = e.album;
-        _dur                 = e.durationSeconds;
-        _pendingRebuildArt   = true;  // deferred — rebuild at start of next frame
+        _title             = e.title;
+        _artist            = e.artist;
+        _album             = e.album;
+        _dur               = e.durationSeconds;
+        _pendingRebuildArt = true;
     });
 
     _idTick = Event::Register<PlaybackTickEvent>([](const PlaybackTickEvent& e) {
@@ -78,8 +113,6 @@ void PlayerPanel::Init() {
         _playing = e.isPlaying;
         _paused  = e.isPaused;
     });
-
-    // Placeholder texture is built on first OnUI() via _pendingRebuildArt = true
 }
 
 void PlayerPanel::Shutdown() {
@@ -91,101 +124,178 @@ void PlayerPanel::Shutdown() {
 // ---- OnUI ---------------------------------------------------------------
 
 void PlayerPanel::OnUI() {
-    // Rebuild art texture here — never mid-frame — so the old descriptor set
-    // lives through any in-flight draw calls from the previous frame.
+    // Defer texture rebuild to frame boundary to avoid descriptor-set hazards
     if (_pendingRebuildArt) {
         RebuildArtTexture();
         _pendingRebuildArt = false;
     }
 
-    ImGuiWindowFlags flags = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoScrollbar;
-    ImGui::Begin("Player", nullptr, flags);
+    ImDrawList* dl     = ImGui::GetWindowDrawList();
+    const float availW = ImGui::GetContentRegionAvail().x;
+    const float padX   = ImGui::GetStyle().WindowPadding.x;
 
-    const float panelW  = ImGui::GetContentRegionAvail().x;
-    const float artSize = 128.0f;
+    // -------------------------------------------------------------------------
+    // Art
+    // -------------------------------------------------------------------------
+    float artSize = std::clamp(availW * Theme::ArtMaxFrac,
+                               Theme::ArtMinPx, Theme::ArtMaxPx);
+    float artOffX = (availW - artSize) * 0.5f;
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + artOffX);
 
-    // --- Album art ---
+    ImVec2 artTL = ImGui::GetCursorScreenPos();
+    ImVec2 artBR = { artTL.x + artSize, artTL.y + artSize };
+
+    // Draw art image (or placeholder)
     if (_artTexture && _artTexture->IsValid()) {
         ImGui::Image(
             reinterpret_cast<ImTextureID>(_artTexture->GetImGuiTextureID()),
-            ImVec2(artSize, artSize));
+            { artSize, artSize });
     } else {
-        ImGui::Dummy(ImVec2(artSize, artSize));
+        // Placeholder: dark amber patterned box
+        dl->AddRectFilled(artTL, artBR, Theme::U32ArtBorder);
+        dl->AddRectFilled(
+            { artTL.x + 2, artTL.y + 2 }, { artBR.x - 2, artBR.y - 2 },
+            Theme::U32BgChild);
+        // Centred music note icon
+        ImVec2 noteSize = ImGui::CalcTextSize(ICON_FA_MUSIC);
+        dl->AddText(
+            { artTL.x + (artSize - noteSize.x) * 0.5f,
+              artTL.y + (artSize - noteSize.y) * 0.5f },
+            Theme::U32AccentDim, ICON_FA_MUSIC);
+        ImGui::Dummy({ artSize, artSize });
     }
 
-    ImGui::SameLine();
-
-    // --- Metadata ---
-    ImGui::BeginGroup();
-    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + panelW - artSize - 16.0f);
-    if (!_title.empty())  ImGui::TextUnformatted(_title.c_str());
-    else                  ImGui::TextDisabled("No track loaded");
-    if (!_artist.empty()) { ImGui::Spacing(); ImGui::TextDisabled("%s", _artist.c_str()); }
-    if (!_album.empty())  {                   ImGui::TextDisabled("%s", _album.c_str()); }
-    ImGui::PopTextWrapPos();
-    ImGui::EndGroup();
+    // Scanline overlay + border drawn ON TOP of art
+    Theme::DrawScanlines(dl, artTL, artBR);
+    // Dim overlay for depth
+    dl->AddRectFilled(artTL, artBR, Theme::U32ArtOverlay);
+    // Amber border
+    dl->AddRect(artTL, artBR, Theme::U32ArtBorder, 0.0f, 0, 1.5f);
 
     ImGui::Spacing();
-    ImGui::Separator();
+
+    // -------------------------------------------------------------------------
+    // Metadata
+    // -------------------------------------------------------------------------
+    ImGui::PushStyleColor(ImGuiCol_Text, Theme::TextBright);
+    if (!_title.empty()) {
+        float tw = ImGui::CalcTextSize(_title.c_str()).x;
+        if (tw < availW)
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (availW - tw) * 0.5f);
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + availW);
+        ImGui::TextUnformatted(_title.c_str());
+        ImGui::PopTextWrapPos();
+    } else {
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (availW - ImGui::CalcTextSize("No track loaded").x) * 0.5f);
+        ImGui::TextUnformatted("No track loaded");
+    }
+    ImGui::PopStyleColor();
+
+    ImGui::PushStyleColor(ImGuiCol_Text, Theme::TextDim);
+    if (!_artist.empty()) {
+        float tw = ImGui::CalcTextSize(_artist.c_str()).x;
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (availW - tw) * 0.5f);
+        ImGui::TextUnformatted(_artist.c_str());
+    }
+    if (!_album.empty()) {
+        float tw = ImGui::CalcTextSize(_album.c_str()).x;
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (availW - tw) * 0.5f);
+        ImGui::TextUnformatted(_album.c_str());
+    }
+    ImGui::PopStyleColor();
+
     ImGui::Spacing();
 
-    // --- Progress bar / seek ---
+    // -------------------------------------------------------------------------
+    // Seek bar (retro segmented)
+    // -------------------------------------------------------------------------
     float progress = (_dur > 0.0f) ? (_pos / _dur) : 0.0f;
-    std::string timeStr = FormatTime(_pos) + " / " + FormatTime(_dur);
+    const float barW = availW;
+    const float barH = Theme::SeekBarH;
 
-    ImGui::PushItemWidth(-1.0f);
-    if (ImGui::SliderFloat("##seek", &progress, 0.0f, 1.0f, "")) {
+    ImVec2 seekPos = ImGui::GetCursorScreenPos();
+    if (RetroBar("##seek", progress, seekPos, { barW, barH }))
         Event::Emit(SeekEvent{ progress * _dur });
-    }
-    ImGui::PopItemWidth();
-    ImGui::TextDisabled("%s", timeStr.c_str());
+
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 2.0f);
+
+    // Time stamps flanking the bar
+    std::string tLeft  = FormatTime(_pos);
+    std::string tRight = FormatTime(_dur);
+    ImGui::PushStyleColor(ImGuiCol_Text, Theme::TextDim);
+    ImGui::TextUnformatted(tLeft.c_str());
+    ImGui::SameLine(availW - ImGui::CalcTextSize(tRight.c_str()).x + padX * 0.5f);
+    ImGui::TextUnformatted(tRight.c_str());
+    ImGui::PopStyleColor();
 
     ImGui::Spacing();
 
-    // --- Transport controls ---
-    float btnW = 40.0f;
-    float totalBtnW = btnW * 5 + ImGui::GetStyle().ItemSpacing.x * 4;
-    ImGui::SetCursorPosX((panelW - totalBtnW) * 0.5f);
+    // -------------------------------------------------------------------------
+    // Transport buttons — centred row
+    // -------------------------------------------------------------------------
+    {
+        float spacing   = ImGui::GetStyle().ItemSpacing.x;
+        float rowW      = 4.0f * Theme::TransportBtnW + 3.0f * spacing;
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (availW - rowW) * 0.5f);
 
-    if (ImGui::Button(ICON_FA_BACKWARD_STEP, ImVec2(btnW, 0))) Event::Emit(SkipPrevEvent{});
-    ImGui::SameLine();
-    const char* playLabel = (_playing && !_paused) ? ICON_FA_PAUSE : ICON_FA_PLAY;
-    if (ImGui::Button(playLabel, ImVec2(btnW, 0))) Event::Emit(PauseToggleEvent{});
-    ImGui::SameLine();
-    if (ImGui::Button(ICON_FA_STOP, ImVec2(btnW, 0)))         Event::Emit(StopEvent{});
-    ImGui::SameLine();
-    if (ImGui::Button(ICON_FA_FORWARD_STEP, ImVec2(btnW, 0))) Event::Emit(SkipNextEvent{});
-    ImGui::SameLine();
-
-    // Shuffle toggle
-    bool shuffled = MusicQueue::IsShuffled();
-    if (shuffled) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
-    if (ImGui::Button(ICON_FA_SHUFFLE, ImVec2(btnW, 0)))      Event::Emit(ShuffleToggleEvent{});
-    if (shuffled) ImGui::PopStyleColor();
-
-    ImGui::Spacing();
-
-    // --- Repeat mode ---
-    RepeatMode rm = MusicQueue::RepeatMode_();
-    const char* repeatSuffix = (rm == RepeatMode::None) ? " Off"
-                             : (rm == RepeatMode::All)  ? " All"
-                                                        : " One";
-    char repeatLabel[32];
-    std::snprintf(repeatLabel, sizeof(repeatLabel), "%s%s", ICON_FA_REPEAT, repeatSuffix);
-    if (rm != RepeatMode::None)
-        ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
-    if (ImGui::Button(repeatLabel)) Event::Emit(RepeatToggleEvent{});
-    if (rm != RepeatMode::None) ImGui::PopStyleColor();
-
-    ImGui::Spacing();
-    ImGui::Separator();
-    ImGui::Spacing();
-
-    // --- Volume ---
-    ImGui::SetNextItemWidth(panelW * 0.6f);
-    if (ImGui::SliderFloat(ICON_FA_VOLUME_HIGH, &_volume, 0.0f, 1.0f)) {
-        Event::Emit(VolumeChangeEvent{ _volume });
+        if (TransportBtn(ICON_FA_BACKWARD_STEP))                     Event::Emit(SkipPrevEvent{});
+        ImGui::SameLine();
+        const char* playIcon = (_playing && !_paused) ? ICON_FA_PAUSE : ICON_FA_PLAY;
+        if (TransportBtn(playIcon))                                   Event::Emit(PauseToggleEvent{});
+        ImGui::SameLine();
+        if (TransportBtn(ICON_FA_STOP))                               Event::Emit(StopEvent{});
+        ImGui::SameLine();
+        if (TransportBtn(ICON_FA_FORWARD_STEP))                       Event::Emit(SkipNextEvent{});
     }
 
-    ImGui::End();
+    ImGui::Spacing();
+
+    // -------------------------------------------------------------------------
+    // Toggle row — shuffle + repeat, centred
+    // -------------------------------------------------------------------------
+    {
+        float spacing   = ImGui::GetStyle().ItemSpacing.x;
+        float rowW      = 2.0f * Theme::ToggleBtnW + spacing;
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (availW - rowW) * 0.5f);
+
+        bool shuffled = MusicQueue::IsShuffled();
+        if (ToggleBtn(ICON_FA_SHUFFLE "  Shuf", shuffled))
+            Event::Emit(ShuffleToggleEvent{});
+
+        ImGui::SameLine();
+
+        RepeatMode rm = MusicQueue::RepeatMode_();
+        const char* repeatLabel = (rm == RepeatMode::All)  ? ICON_FA_REPEAT "  All"
+                                : (rm == RepeatMode::One)  ? ICON_FA_REPEAT "  One"
+                                :                            ICON_FA_REPEAT "  Off";
+        if (ToggleBtn(repeatLabel, rm != RepeatMode::None))
+            Event::Emit(RepeatToggleEvent{});
+    }
+
+    ImGui::Spacing();
+
+    // -------------------------------------------------------------------------
+    // Volume (retro segmented)
+    // -------------------------------------------------------------------------
+    {
+        float iconW  = ImGui::CalcTextSize(ICON_FA_VOLUME_HIGH).x + ImGui::GetStyle().ItemSpacing.x;
+        float volBarW = availW - iconW;
+
+        ImGui::PushStyleColor(ImGuiCol_Text, Theme::AccentDim);
+        ImGui::TextUnformatted(ICON_FA_VOLUME_HIGH);
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+
+        ImVec2 volPos  = ImGui::GetCursorScreenPos();
+        float  volOff  = (Theme::VolumeBarH < ImGui::GetTextLineHeight())
+                       ? (ImGui::GetTextLineHeight() - Theme::VolumeBarH) * 0.5f
+                       : 0.0f;
+        volPos.y += volOff;
+
+        if (RetroBar("##vol", _volume, volPos, { volBarW, Theme::VolumeBarH }))
+            Event::Emit(VolumeChangeEvent{ _volume });
+    }
+
+    ImGui::Spacing();
 }
+

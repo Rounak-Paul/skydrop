@@ -1,6 +1,5 @@
 #include "menu_bar.h"
 
-#include "stats_panel.h"
 #include "ui_events.h"
 #include "music_events.h"
 #include "event.h"
@@ -18,13 +17,6 @@ void MenuBar::OnMenuBar() {
         ImGui::Separator();
         if (ImGui::MenuItem("Exit", "Esc"))
             Event::Emit(QuitEvent{});
-        ImGui::EndMenu();
-    }
-
-    if (ImGui::BeginMenu("View")) {
-        bool statsVisible = StatsPanel::IsVisible();
-        if (ImGui::MenuItem("Stats", nullptr, &statsVisible))
-            Event::Emit(ToggleStatsEvent{});
         ImGui::EndMenu();
     }
 }
