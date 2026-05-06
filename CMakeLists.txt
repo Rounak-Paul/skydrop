@@ -46,6 +46,7 @@ add_executable(skydrop
     src/skydrop/event.cc
     src/skydrop/job_system.cc
     src/skydrop/annotations.cc
+    src/skydrop/session.cc
     src/skydrop/ui/sound_panel.cc
     src/skydrop/audio/audio_player.cc
     src/skydrop/audio/music_queue.cc

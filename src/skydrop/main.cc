@@ -4,9 +4,9 @@ int main() {
     SkyDropApp app;
     app.Run(tvk::AppConfig{
         .title    = "Skydrop",
-        .width    = 200,
-        .height   = 300,
-        .resizable = false,
+        .width    = 280,
+        .height   = 420,
+        .resizable = true,
         .enableIdleThrottling = true
     });
     return 0;
