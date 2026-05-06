@@ -4,8 +4,6 @@
 #include "music_events.h"
 #include "audio/audio_player.h"
 #include "audio/music_queue.h"
-#include "annotations.h"
-
 #include <tinyvk/tinyvk.h>
 #include <tinyvk/assets/icons_font_awesome.h>
 #include <imgui.h>
@@ -43,10 +41,6 @@ int                    PlayerPanel::_artTexH = 1;
 std::vector<float> PlayerPanel::_waveform;
 std::string        PlayerPanel::_currentTrackPath;
 
-bool  PlayerPanel::_showAnnotPopup = false;
-float PlayerPanel::_annotPopupPos  = 0.0f;
-char  PlayerPanel::_annotInputBuf[256] = {};
-
 // ---- Helpers ------------------------------------------------------------
 
 static std::string FormatTime(float s) {
@@ -75,18 +69,16 @@ static bool ToggleBtn(const char* label, bool active) {
 }
 
 // ---- Waveform seek widget ------------------------------------------------
-// Draws the waveform bars, playhead, annotation pins and handles interactions.
-// Returns true when the user seeked (newProgress updated).
-// Sets *rightClickPos to the time in seconds if the user right-clicked.
-static bool DrawWaveformSeek(
-    const char*                  id,
-    float&                       progress,
-    const std::vector<float>&    waveform,
-    const std::vector<Annotation>& annots,
-    float                        duration,
-    ImVec2                       pos,
-    ImVec2                       size,
-    float*                       rightClickPos)   // nullptr = no right-click reporting
+// Draws the waveform seek bar.
+// - `progress`  : current playback fraction [0,1], controls fill and amber playhead.
+// - Returns the seek target fraction [0,1] on mouse release, or -1.0f when idle.
+static float DrawWaveformSeek(
+    const char*               id,
+    float                     progress,
+    const std::vector<float>& waveform,
+    float                     duration,
+    ImVec2                    pos,
+    ImVec2                    size)
 {
     ImDrawList* dl = ImGui::GetWindowDrawList();
 
@@ -107,70 +99,51 @@ static bool DrawWaveformSeek(
             dl->AddRectFilled({ x, midY - h }, { x + bw, midY + h }, col);
         }
     } else {
-        // Fallback: plain segment bar while waveform is still loading
         Theme::DrawSegBar(dl, pos, size, progress);
     }
 
-    // Playhead vertical line
+    // Amber playhead at current playback position
     const float playX = pos.x + progress * size.x;
     dl->AddLine({ playX, pos.y }, { playX, pos.y + size.y },
                 IM_COL32(255, 240, 150, 240), 1.5f);
 
-    // Annotation pins — upward triangle at bottom + dim vertical line
-    if (duration > 0.0f) {
-        for (const auto& ann : annots) {
-            const float ax = pos.x + (ann.posSeconds / duration) * size.x;
-            dl->AddLine({ ax, pos.y + 4.0f }, { ax, pos.y + size.y },
-                        IM_COL32(255, 155, 40, 150), 1.0f);
-            // Triangle pointing up from bottom edge
-            dl->AddTriangleFilled(
-                { ax,        pos.y + size.y        },
-                { ax - 4.5f, pos.y + size.y - 7.0f },
-                { ax + 4.5f, pos.y + size.y - 7.0f },
-                IM_COL32(255, 155, 40, 220));
-        }
-    }
-
     // Invisible button for mouse interaction
     ImGui::SetCursorScreenPos(pos);
-    ImGui::InvisibleButton(id, size,
-        ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight);
+    ImGui::InvisibleButton(id, size, ImGuiButtonFlags_MouseButtonLeft);
 
-    bool seeked = false;
-    if (ImGui::IsItemActive() && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+    // Compute drag fraction whenever the button is active or just released
+    float dragFrac = -1.0f;
+    if (ImGui::IsItemActive() || ImGui::IsItemDeactivated()) {
         const float mx = ImGui::GetIO().MousePos.x;
-        progress = std::clamp((mx - pos.x) / size.x, 0.0f, 1.0f);
-        seeked = true;
+        dragFrac = std::clamp((mx - pos.x) / size.x, 0.0f, 1.0f);
     }
 
-    if (rightClickPos && ImGui::IsItemClicked(ImGuiMouseButton_Right) && duration > 0.0f) {
-        const float mx = ImGui::GetIO().MousePos.x;
-        *rightClickPos = std::clamp((mx - pos.x) / size.x, 0.0f, 1.0f) * duration;
-    } else if (rightClickPos) {
-        *rightClickPos = -1.0f;  // sentinel: no right-click this frame
-    }
-
-    // Hover tooltip — annotation label or time position
-    if (ImGui::IsItemHovered() && duration > 0.0f) {
-        const float mx = ImGui::GetIO().MousePos.x;
-        bool showedAnnot = false;
-        for (const auto& ann : annots) {
-            const float pixDist = std::fabs((ann.posSeconds / duration) * size.x
-                                            - (mx - pos.x));
-            if (pixDist < 9.0f) {
-                ImGui::SetTooltip("%s\n@ %s", ann.label.c_str(),
-                                  FormatTime(ann.posSeconds).c_str());
-                showedAnnot = true;
-                break;
-            }
-        }
-        if (!showedAnnot) {
-            const float hoverSec = std::clamp((mx - pos.x) / size.x, 0.0f, 1.0f) * duration;
-            ImGui::SetTooltip("%s  (right-click to annotate)", FormatTime(hoverSec).c_str());
+    // Ghost line + time label while dragging
+    if (ImGui::IsItemActive() && dragFrac >= 0.0f) {
+        const float gx = pos.x + dragFrac * size.x;
+        // Dim the gap between playhead and drag line
+        dl->AddLine({ gx, pos.y }, { gx, pos.y + size.y },
+                    IM_COL32(255, 255, 255, 200), 1.0f);
+        // Time label above the bar
+        if (duration > 0.0f) {
+            const std::string t = FormatTime(dragFrac * duration);
+            const ImVec2 ts     = ImGui::CalcTextSize(t.c_str());
+            float lx = gx - ts.x * 0.5f;
+            lx = std::clamp(lx, pos.x, pos.x + size.x - ts.x);
+            const float ly = pos.y - ts.y - 2.0f;
+            dl->AddText(nullptr, 0.0f, { lx, ly }, Theme::U32TextPrimary, t.c_str());
         }
     }
 
-    return seeked;
+    // Hover tooltip when not dragging
+    if (ImGui::IsItemHovered() && !ImGui::IsItemActive() && duration > 0.0f) {
+        const float mx       = ImGui::GetIO().MousePos.x;
+        const float hoverSec = std::clamp((mx - pos.x) / size.x, 0.0f, 1.0f) * duration;
+        ImGui::SetTooltip("%s", FormatTime(hoverSec).c_str());
+    }
+
+    // Return seek target only on release
+    return ImGui::IsItemDeactivated() ? dragFrac : -1.0f;
 }
 
 void PlayerPanel::RebuildArtTexture() {
@@ -248,6 +221,15 @@ void PlayerPanel::OnUI() {
     if (_pendingRebuildArt) {
         RebuildArtTexture();
         _pendingRebuildArt = false;
+    }
+
+    // ---- Keyboard seek (left / right arrow) ---------------------------------
+    if (_dur > 0.0f && !ImGui::GetIO().WantTextInput) {
+        float delta = 0.0f;
+        if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) delta = +5.0f;
+        if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow))  delta = -5.0f;
+        if (delta != 0.0f)
+            Event::Emit(SeekEvent{ std::clamp(_pos + delta, 0.0f, _dur) });
     }
 
     ImDrawList* dl      = ImGui::GetWindowDrawList();
@@ -349,57 +331,18 @@ void PlayerPanel::OnUI() {
     ImGui::SetCursorPosX(pad);
 
     // ---- Waveform seek bar --------------------------------------------------
-    const std::vector<Annotation> annots =
-        _currentTrackPath.empty() ? std::vector<Annotation>{}
-                                  : Annotations::GetForTrack(_currentTrackPath);
-
-    float progress = (_dur > 0.0f) ? (_pos / _dur) : 0.0f;
+    const float progress = (_dur > 0.0f) ? (_pos / _dur) : 0.0f;
 
     ImGui::SetCursorPosX(pad);
     const ImVec2 wavePos = ImGui::GetCursorScreenPos();
-    float rightClickSec = -1.0f;
 
-    if (DrawWaveformSeek("##seek", progress, _waveform, annots,
-                         _dur, wavePos, { innerW, Theme::WaveformH },
-                         &rightClickSec))
-        Event::Emit(SeekEvent{ progress * _dur });
+    const float seekFrac = DrawWaveformSeek("##seek", progress, _waveform,
+                                            _dur, wavePos, { innerW, Theme::WaveformH });
+    if (seekFrac >= 0.0f)
+        Event::Emit(SeekEvent{ seekFrac * _dur });
 
-    // Open annotation popup on right-click — must come before any other widget
-    if (rightClickSec >= 0.0f) {
-        _annotPopupPos = rightClickSec;
-        _annotInputBuf[0] = '\0';
-        ImGui::OpenPopup("##add_annot");
-    }
     // Advance cursor past the waveform (InvisibleButton already consumed it)
     ImGui::SetCursorScreenPos({ wavePos.x, wavePos.y + Theme::WaveformH });
-
-    // Annotation add popup
-    if (ImGui::BeginPopup("##add_annot")) {
-        ImGui::PushStyleColor(ImGuiCol_Text, Theme::TextPrimary);
-        ImGui::TextUnformatted("Add annotation");
-        ImGui::PopStyleColor();
-        ImGui::Separator();
-
-        char timeBuf[16];
-        std::snprintf(timeBuf, sizeof(timeBuf), "@ %s", FormatTime(_annotPopupPos).c_str());
-        ImGui::PushStyleColor(ImGuiCol_Text, Theme::TextDim);
-        ImGui::TextUnformatted(timeBuf);
-        ImGui::PopStyleColor();
-
-        ImGui::SetNextItemWidth(200.0f);
-        const bool enter = ImGui::InputText("##annot_label", _annotInputBuf,
-                                            sizeof(_annotInputBuf),
-                                            ImGuiInputTextFlags_EnterReturnsTrue);
-        ImGui::SameLine();
-        if ((ImGui::Button("OK") || enter) && _annotInputBuf[0] != '\0') {
-            if (!_currentTrackPath.empty())
-                Annotations::Add(_currentTrackPath, _annotPopupPos, _annotInputBuf);
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
-        ImGui::EndPopup();
-    }
 
     // Time stamps — inline, no spacing above
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, { ImGui::GetStyle().ItemSpacing.x, 1.0f });

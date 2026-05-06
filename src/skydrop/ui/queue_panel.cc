@@ -67,11 +67,19 @@ void QueuePanel::OnUI() {
 
     // ---- Track list -----------------------------------------------------
     const ImVec2 listSize = { 0.0f, ImGui::GetContentRegionAvail().y };
-    if (!ImGui::BeginChild("##tracklist", listSize, false,
+    if (!ImGui::BeginChild("##tracklist", listSize,
+                           ImGuiChildFlags_AlwaysUseWindowPadding,
                            ImGuiWindowFlags_NoScrollbar)) {
         ImGui::EndChild();
         return;
     }
+
+    // AlwaysUseWindowPadding adds WindowPadding on all sides, so
+    // GetContentRegionAvail() already excludes both margins — no extra offset.
+    const float childW  = ImGui::GetContentRegionAvail().x;
+    const float iconW   = ImGui::CalcTextSize(ICON_FA_CIRCLE_DOT).x;
+    const float spacing = ImGui::GetStyle().ItemSpacing.x;
+    const float selW    = childW - iconW - spacing;
 
     int32_t removeIdx = -1;
 
@@ -79,7 +87,7 @@ void QueuePanel::OnUI() {
         const auto& t          = _tracks[i];
         const bool  isCurrent  = (i == _currentIndex);
 
-        // Build label
+        // Build label — name part only (duration shown separately)
         std::string label;
         if (!t.title.empty() && !t.artist.empty())
             label = t.artist + "  \xe2\x80\x93  " + t.title; // en-dash
@@ -87,6 +95,15 @@ void QueuePanel::OnUI() {
             label = t.title;
         else
             label = t.path;
+
+        // Duration suffix
+        if (t.durationSeconds > 0.0f) {
+            int m = static_cast<int>(t.durationSeconds) / 60;
+            int s = static_cast<int>(t.durationSeconds) % 60;
+            char dur[12];
+            std::snprintf(dur, sizeof(dur), " [%d:%02d]", m, s);
+            label += dur;
+        }
 
         char selId[32];
         std::snprintf(selId, sizeof(selId), "##row%d", i);
@@ -101,34 +118,20 @@ void QueuePanel::OnUI() {
                 IM_COL32(80, 53, 0, 80));
         }
 
-        // Leading now-playing icon
+        // Icon column (fixed width) — playing indicator or blank spacer
         if (isCurrent) {
             ImGui::PushStyleColor(ImGuiCol_Text, Theme::AccentHot);
             ImGui::TextUnformatted(ICON_FA_CIRCLE_DOT);
             ImGui::PopStyleColor();
-            ImGui::SameLine();
         } else {
-            // Indent by icon width for alignment
-            ImGui::SetCursorPosX(
-                ImGui::GetCursorPosX()
-                + ImGui::CalcTextSize(ICON_FA_CIRCLE_DOT).x
-                + ImGui::GetStyle().ItemSpacing.x);
+            ImGui::Dummy({ iconW, ImGui::GetTextLineHeight() });
         }
+        ImGui::SameLine();
 
-        // Duration suffix
-        if (t.durationSeconds > 0.0f) {
-            int m = static_cast<int>(t.durationSeconds) / 60;
-            int s = static_cast<int>(t.durationSeconds) % 60;
-            char dur[12];
-            std::snprintf(dur, sizeof(dur), " [%d:%02d]", m, s);
-            label += dur;
-        }
-
-        // Coloured selectable
+        // Selectable with explicit width so text is clipped, not overflowed
         ImGui::PushStyleColor(ImGuiCol_Text,
             isCurrent ? Theme::AccentHot : Theme::TextPrimary);
-        if (ImGui::Selectable(label.c_str(), isCurrent,
-                              ImGuiSelectableFlags_SpanAllColumns))
+        if (ImGui::Selectable(label.c_str(), isCurrent, 0, { selW, 0.0f }))
             Event::Emit(PlayTrackEvent{ i });
         ImGui::PopStyleColor();
 

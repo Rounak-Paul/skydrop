@@ -45,10 +45,5 @@ private:
 
     // Waveform (1024 normalized RMS peaks)
     static std::vector<float> _waveform;
-    static std::string        _currentTrackPath;  // for annotation lookup
-
-    // Annotation popup state
-    static bool  _showAnnotPopup;
-    static float _annotPopupPos;    // seconds
-    static char  _annotInputBuf[256];
+    static std::string        _currentTrackPath;
 };

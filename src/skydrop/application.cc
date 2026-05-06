@@ -2,7 +2,6 @@
 
 #include "event.h"
 #include "job_system.h"
-#include "annotations.h"
 #include "audio/audio_player.h"
 #include "audio/music_queue.h"
 #include "ui/menu_bar.h"
@@ -21,7 +20,6 @@ void SkyDropApp::OnStart() {
     JobSystem::Init();
     AudioPlayer::Init();
     MusicQueue::Init();
-    Annotations::Init();
 
     Theme::Apply();
     SetClearColor(0.047f, 0.035f, 0.008f, 1.0f);
@@ -56,7 +54,6 @@ void SkyDropApp::OnStop() {
     QueuePanel::Shutdown();
     PlayerPanel::Shutdown();
     MusicQueue::Shutdown();
-    Annotations::Shutdown();
     AudioPlayer::Shutdown();
     JobSystem::Shutdown();
     Event::Shutdown();

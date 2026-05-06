@@ -815,8 +815,11 @@ void AudioPlayer::Seek(float seconds) {
     std::lock_guard<std::mutex> lk(s_StateMutex);
     if (!s_Source) return;
     ALint state; alGetSourcei(s_Source, AL_SOURCE_STATE, &state);
+    // AL_SEC_OFFSET on a playing/paused source takes effect immediately.
+    // Do NOT call alSourcePlay if already playing — it would restart from 0.
     alSourcef(s_Source, AL_SEC_OFFSET, seconds);
-    if (state == AL_PLAYING) alSourcePlay(s_Source);
+    if (state != AL_PLAYING && state != AL_PAUSED)
+        alSourcePlay(s_Source);
 }
 
 void AudioPlayer::SetVolume(float v) {
