@@ -875,6 +875,46 @@ bool AudioPlayer::CopyAlbumArt(std::vector<uint8_t>& pixels, int& width, int& he
     return true;
 }
 
+bool AudioPlayer::ExtractArt(const std::string& path,
+                               std::vector<uint8_t>& pixels, int& w, int& h) {
+    const std::string ext = ToLower(std::filesystem::path(path).extension().string());
+
+    if (ext == ".mp3") {
+        return TryExtractMp3Art(path, pixels, w, h);
+
+    } else if (ext == ".flac") {
+        struct Meta { std::vector<uint8_t> blob; };
+        Meta meta;
+        drflac* flac = drflac_open_file_with_metadata(
+            path.c_str(),
+            [](void* ud, drflac_metadata* m) {
+                auto* meta = static_cast<Meta*>(ud);
+                if (m->type == DRFLAC_METADATA_BLOCK_TYPE_PICTURE) {
+                    if (meta->blob.empty() || m->data.picture.type == 3) {
+                        if (m->data.picture.pPictureData && m->data.picture.pictureDataSize > 0) {
+                            meta->blob.assign(
+                                m->data.picture.pPictureData,
+                                m->data.picture.pPictureData + m->data.picture.pictureDataSize);
+                        }
+                    }
+                }
+            }, &meta, nullptr);
+        if (flac) drflac_close(flac);
+        if (!meta.blob.empty())
+            return DecodeArtBlob(meta.blob.data(), (int)meta.blob.size(), pixels, w, h);
+        return false;
+
+    } else if (ext == ".ogg") {
+        stb_vorbis* v = stb_vorbis_open_filename(path.c_str(), nullptr, nullptr);
+        if (!v) return false;
+        stb_vorbis_comment c = stb_vorbis_get_comment(v);
+        bool ok = TryExtractOggArt(c, pixels, w, h);
+        stb_vorbis_close(v);
+        return ok;
+    }
+    return false;
+}
+
 std::string AudioPlayer::GetTitle()  { std::lock_guard<std::mutex> lk(s_StateMutex); return s_Title;  }
 std::string AudioPlayer::GetArtist() { std::lock_guard<std::mutex> lk(s_StateMutex); return s_Artist; }
 std::string AudioPlayer::GetAlbum()  { std::lock_guard<std::mutex> lk(s_StateMutex); return s_Album;  }

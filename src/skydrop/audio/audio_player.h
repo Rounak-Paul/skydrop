@@ -34,6 +34,12 @@ public:
     // Returns false (and leaves pixels empty) when no art is available.
     static bool CopyAlbumArt(std::vector<uint8_t>& pixels, int& width, int& height);
 
+    // Extract album art from an arbitrary file path without decoding audio.
+    // Reads only the metadata portion of the file — fast enough for batch use.
+    // Returns false when the format is unsupported or no art is embedded.
+    static bool ExtractArt(const std::string& path,
+                            std::vector<uint8_t>& pixels, int& width, int& height);
+
     // ID3 / file-format metadata (returned by value — safe from any thread)
     static std::string GetTitle();
     static std::string GetArtist();
